@@ -1,0 +1,33 @@
+module.exports = {
+  apps: [
+    {
+      name: 'konnexthome',
+      script: './dist/main.js',
+      watch: false,
+      restart_delay: 15000,
+      env: {
+        NODE_ENV: 'development',
+        KONNEXTONLINE_URL: 'https://rest.api.konnextonline.com.au/dev',
+        AWS_IOT_ENDPOINT: 'a2osge8f2cygqo-ats.iot.ap-southeast-2.amazonaws.com',
+        AWS_IOT_AUTHORIZER: 'konnext-online-authorizor',
+        SERIAL_NUMBER: '',
+        DATABASE_URL: 'postgresql://postgres:Konnext.Home.psql@localhost:3004/konnexthome?schema=public',
+        REDIS_HOST: 'localhost',
+        REDIS_PORT: '6379',
+        REDIS_PASSWORD: 'Konnext.Home.redis',
+        HOME_LINK_MQTT_PORT: '3010',
+        INTEGRATION_MQTT_PORT: '3011',
+        AUDIO_MATRIX_VERSION: 'v2',
+        INTEGRATION_MQTT_USERNAME: 'admin',
+        INTEGRATION_MQTT_PASSWORD: 'Admin.123',
+        ZH_LOGGER_LEVEL: 'INFO',
+        ZHC_LOGGER_LEVEL: 'INFO',
+        GRAFANA_LOKI_USERNAME: '1085395',
+        GRAFANA_LOKI_PASSWORD: 'glc_eyJvIjoiMTI2OTg5MiIsIm4iOiJzZXJ2ZXItbG9nLXBvbGljeS1sb2ctdG9rZW4iLCJrIjoiOHRIRzg3MU9GOEFTVTM1V2sxRTFBNGlCIiwibSI6eyJyIjoicHJvZC1hdS1zb3V0aGVhc3QtMSJ9fQ==',
+        GRAFANA_LOKI_HOST: 'https://logs-prod-026.grafana.net',
+        debugMode: 1,
+        SERIAL_NUMBER: 'HOMEFCHP38N2'
+      },
+    },
+  ],
+};

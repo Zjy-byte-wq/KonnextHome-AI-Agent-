@@ -1,0 +1,33 @@
+- 思路可行：输入是用户指定的一组 cameraId（数量动态），后端抓取各路快照并按数量/layout 拼成一张大图，返回 base64/data URL 给 LLM，一次性分析全景，减少 token 成本。实现关键点是：a) 在 chatbot 工具层暴露 `stitch_camera_images` 之类的 tool；b) 工具内部按 cameraId 拉图、拼图；c) 返回结构兼容现有 openaiContent/langchainContent。  
+- 每一步实施方案（聚焦 /src/integrations/chatbot 下）：  
+  1) 定义工具描述与 schema  
+     - camera.tool.provider.ts  
+     - 在类内新增 `getCameraStitchDescription(language: string)`，描述支持多路摄像头拼合。  
+     - Schema 建议：`cameraIds: string[]`（必填），`layout?: 'auto'|'2x2'|'1xN'|'Nx1'`，`intervalSeconds?: number`（如需时间对齐，可忽略），`outputFormat?: 'jpeg'|'png'`。  
+  2) 实现拼图工具逻辑  
+     - 文件：同上，`generateCameraTools` 中 push 新的 DynamicStructuredTool（name: `stitch_camera_images`）。  
+     - 步骤：  
+       a) 校验 cameraIds，查元数据 `deviceManager.getCameraMetaData(userId)` 找到名称用于文案；未找到返回 CAMERA_NOT_FOUND。  
+       b) 对每个 cameraId 调用 `deviceManager.getCameraSnapshot(cameraId)` 获取 Buffer；若任一为空返回 CAMERA_OFFLINE。  
+       c) 调用拼图实现：如果已有图片拼接库/服务，封装为 helper（可放同文件私有函数或 utils），输入 Buffer[] + layout，输出合成 Buffer。没有库时临时可用 sharp/jimp（需在更上层安装依赖），但这里先预留 TODO 或调用已有服务接口。  
+       d) 把合成 Buffer 转 base64，构造 data URL，返回 JSON：`success`, `code:'OK'`, `cameraIds`, `layout`, `contentType`, data, `size`, `message`；并设置 `openaiContent`/`langchainContent` 包含一条 image_url，detail 用 'auto'。  
+  3) 上下文提示  
+     - camera.tool.provider.ts  
+     - 在 `generateCameraContext` 追加说明：`stitch_camera_images: merge multiple camera snapshots into one grid (pass cameraIds)`，让 LLM 知道可用。  
+  4) 聚合与缓存  
+     - tool.provider.ts  
+     - 已自动收集 camera tools，无需改 wiring；保持 `clearToolDescriptionCache` 调 camera provider 即可。  
+  5) （可选）布局/大小策略  
+     - 在拼图函数里：若 cameraIds 数量为 1 直接返回原图；2 用 1x2，3-4 用 2x2，5-6 用 2x3，>6 可用 ceil(sqrt(n)) 的 auto grid。  
+     - 控制输出尺寸（如宽 1280 或 1920）以防过大。  
+  6) （可选）错误与降级  
+     - 若部分摄像头失败，可选策略：a) 直接失败；b) 用占位底图并在 message 标注缺失列表。决定后写入 message。  
+  7) （可选）上传/外部图片  
+     - 如果未来要支持用户上传或 URL 混拼，在 schema 里扩展 `sources: {cameraId?; imageBase64?; imageUrl?;}[]`，逻辑先取 cameraId 走已有抓拍，否则加载传入的 base64/URL。现阶段按纯 cameraId 实现即可。  
+  8) 测试建议  
+     - 写一个最小的 e2e/单测：构造假 deviceManager mock，返回两张 Buffer，调用工具函数，断言返回 JSON 中 `success` 和 `openaiContent[1].image_url.url` 可被 base64 解析。  
+     - 手工调用接口：在聊天里触发 `stitch_camera_images`，传入 2-4 个 cameraId，检查日志与返回。  
+  9) 性能与安全  
+     - 给拼图输出设最大分辨率与超时；对 data URL 仅在内部传递，不持久化。  
+     - 如果使用 sharp/jimp，考虑放在 service 层或单独 helper，避免工具文件过重。  
+- 下一步若需要，我可以直接在 camera.tool.provider.ts 里补全上述描述函数、工具注册和占位拼图实现（留 TODO 或调用你指定的拼图服务）。
