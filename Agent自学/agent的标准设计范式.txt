@@ -1,0 +1,47 @@
+1. 设计tools，prompt, model
+##prompt##
+from langchain.prompts import PromptTemplate
+prompt = PromptTemplate.from_template()
+##model##
+from langchain_openai import ChatOpenAI
+model = ChatOpenAI()
+##tools##
+@tool
+def camera_zoom():
+def capture_frame_tool():
+......
+tools = [camera_zoom, capture_frame_tool, analyze_image_tool, move_to_preset_tool, find_target_tool]
+
+2. 初始化输出回调callback
+##使用标准输出回调捕获调试信息##
+from langchain.callbacks import StdOutCallbackHandler
+ callback = StdOutCallbackHandler()
+##使用标准输出回调捕获调试信息##
+
+3. 传入agent
+from langchain.agents import create_react_agent
+agent = create_react_agent(model, tools, prompt)
+
+4. 设计agent执行器
+from langchain.agents import AgentExecutor
+agent_executor = AgentExecutor.from_agent_and_tools(
+        agent=agent,
+        tools=tools,
+        callbacks=[callback],         # 使用标准输出回调
+        verbose=True,                 # 在控制台打印 Thought/Action/Observation
+        handle_parsing_errors=True,   # 自动处理LLM输出格式问题
+        max_iterations=50,            # 限制最大迭代次数，防止无限循环
+        max_execution_time=300        # 限制最大执行时间，防止长时间运行
+    )
+
+5. 定义用户输入， 传入agent执行器
+## user input ##
+user_input = "帮我看看外面有没有垃圾桶，当前画面没找到的话可以调用find_target_tool"
+
+result = agent_executor.invoke({"input": user_input}, handle_parsing_errors=True,
+                                      config={
+                                        "run_name": "door-camera-test", # 给本次执行起名字
+                                        "tags": ["camera", "zoom", "analysis"], # 给本次执行打标签
+                                        "metadata": {"user": "eric", "scene": "door-inspection"} #记录本次执行额外上下文信息
+    })
+print(result)
