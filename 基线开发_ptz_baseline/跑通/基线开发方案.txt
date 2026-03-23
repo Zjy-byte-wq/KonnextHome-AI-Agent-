@@ -1,0 +1,91 @@
+方案最新（基线：只接入 status/capabilities）
+
+阶段 0：配置与 HTTP 封装（最小改动）
+目标：PTZ 与普通 camera 分离，便于后续扩展 move/zoom/stop。
+
+改动位置：
+
+app.config.ts
+新增 ptzProgram 配置：
+ptzProgram.url = http://172.16.10.202
+ptzProgram.username = admin
+ptzProgram.password = Admin.123
+http-client.module.ts
+注册并导出 PtzHttpClientService（新建服务）。
+新增 ptz-http-client.service.ts
+封装两个接口（返回结构与 camera 类似）：
+getPtzCapabilities(channelId, userId) -> GET /ISAPI/PTZCtrl/channels/<ID>/capabilities
+getPtzStatus(channelId, userId) -> GET /ISAPI/PTZCtrl/channels/<ID>/status
+建议返回格式：
+
+{
+  "success": true,
+  "code": "OK",
+  "data": { ... }, 
+  "message": "PTZ status fetched."
+}
+失败时：
+
+{
+  "success": false,
+  "code": "PTZ_ERROR",
+  "message": "Failed to fetch PTZ status."
+}
+阶段 1：PTZ Tools 层（不影响 Vision）
+目标：PTZ 独立工具，不污染 Vision 工具。
+
+改动位置：
+
+新增 ptz-camera.tool.provider.ts
+工具：
+ptz_get_capabilities（参数：channelId）
+ptz_get_status（参数：channelId）
+tool.module.ts
+将 PtzCameraToolProvider 加入 providers，并导出（若 LangGraph 需要注入）。
+阶段 2：Context Builder（路由识别 ptz）
+目标：PTZ 有独立上下文提示。
+
+改动位置：
+
+context-builder.interface.ts
+RouteType 和 IntentType 增加 "ptz"
+mapIntentToRouteType & getIntentDescription 增加 ptz
+ptz-context.builder.ts
+新增 PTZ Context Builder（系统提示强调“PTZ 只处理云台状态/能力查询”）。
+context-builder.factory.ts
+注册 ptz builder。
+router-context.builder.ts
+更新 schema & prompt：
+PTZ 状态/能力查询 -> ptz
+摄像头“看图” -> vision
+普通设备控制 -> home_control
+阶段 3：LangGraph（PTZ Agent + 节点）
+目标：PTZ 与 Vision/HomeControl 并列运行。
+
+改动位置：
+muti-agent-graph.ts
+
+buildGraph 增加 ptzAgent
+增加 ptzGetStatus / ptzGetCapabilities 节点
+getAgentNodeName 增加 ptz
+routeFromRouter 兼容 ptz
+executeToolCalls 增加 ptz 工具映射
+阶段 4：Device Mapping + RAG Tool Gating
+目标：RAG 不误判，工具路由稳定。
+
+改动位置：
+
+device-mappings.ts
+新增 mapping：
+type: "ptz_camera"（或 "ptz"，但不要和 agent type 混淆）
+tools: ["ptz_get_capabilities","ptz_get_status"]
+nodeNames: ["ptzGetCapabilities","ptzGetStatus"]
+keywords: "云台/转动/变焦/预置位/状态/能力"
+tools_v2.json
+新增 PTZ 工具定义（embedding_text + example_queries 必填）。
+必须确认的两个问题（决定 HTTP 实现）
+
+PTZ 接口是否是 HTTP Digest 认证？
+PTZ 接口是否是 http 还是 https，是否有端口（如 (line 80) / (line 443) / (line 8000)）？
+如果你确认这两个问题，我可以直接开始修改代码并提交实现。
+你也可以直接回答：“用 Digest + http:80” 或 “用 Basic + https:443”。

@@ -1,0 +1,342 @@
+你现在项目里 PTZ 只有“查能力/查状态”，要落地你的需求，核心就是补 5 个工具：移动、变焦、抓拍、分析、巡检。
+最小可跑通路径是：先改 ptz-http-client.service.ts + ptz-camera.tool.provider.ts + device-mappings.ts + multi-agent-graph.ts。
+再补 main.ts 静态目录和 ptz-debug.ts 调试入口，这样你能本地完整验证“移动-抓拍-分析-巡检”闭环。
+
+一、先跑通要实现的功能
+
+新增 PTZ 业务工具：move_to_preset_tool、camera_zoom、capture_frame_tool、analyze_image_tool、find_target_tool。
+PTZ 物理动作（移动/变焦）串行；图像分析并发（max_workers）。
+抓拍落盘到 data/，文件名带时间戳；返回结构化信息。
+公网 URL 探测失败返回 {"error":"..."}。
+扫描预设位找到目标后尽快早停，最后返回 found/best_preset/details/elapsed_sec。
+提供本地 main() 调试入口，失败非 0 退出码。
+
+二、改动文件清单（按优先级）
+
+app.config.ts--》配置增加 NGROK + CAM_* 回退
+main.ts --》 开放本地 data/ 静态目录（给公网 URL 用）
+ptz-http-client.service.ts --》PTZ HTTP 客户端补齐“控制+抓拍+探测”
+(1) 扩展 import（保留原有 import）(2) 3.2 扩展 requestDigest（支持 PUT / body / timeout / responseType）(3) 新增 PTZ 功能方法（核心）
+ptz-camera.tool.provider.ts--》PTZ 工具提供者增加 5 个工具
+(1) import 增加 (2) 增加 OpenAI 客户端和辅助类型 （3）generatePtzTools 增加新工具注册 (4) 新增 runAnalyzeImageTool / runFindTargetTool
+device-mappings.ts--》工具到节点映射补全（否则新工具不会执行）
+multi-agent-graph.ts --》 Multi-Agent Graph 增加 PTZ 新节点
+(1) buildGraph 增加节点和边 (2) 增加执行方法 (3) 查询类白名单补齐（给响应聚合用）
+ptz-context.builder.ts --》PTZ Agent 提示词补全（让模型会调新工具）
+package.json
+新增 ptz-debug.ts
+
+
+三、改动后的静态检查
+**静态检查结论（7个变更文件）**
+
+1. **是否满足 PTZ 开发方案提到改动**  
+部分满足。  
+- 已覆盖：配置回退、静态目录、PTZ HTTP 能力扩展、PTZ 新工具、路由映射、PTZ 上下文提示词、Graph 新节点。  
+- 但**未完全可用**，有阻断级问题（见下）。
+
+2. **是否有重大缺陷**  
+有，且有 1 个阻断级缺陷-->普通camera和ptz camera没有完全隔离
+
+- **阻断级**：新增 PTZ 工具会被分发到错误 provider，导致“工具找不到/不执行”。  
+  - 位置1：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts#L914)  
+  - 位置2：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts#L1580)  
+  - 原因：只按 `toolName.startsWith("ptz_")` 选择 PTZ provider，而你新增的工具名是 `move_to_preset_tool/camera_zoom/capture_frame_tool/analyze_image_tool/find_target_tool`，不满足 `ptz_` 前缀。  
+  - 影响：Agent 路由到了新节点，但执行阶段可能拿不到对应工具，PTZ 新功能无法真正跑通。
+
+- **高风险（需求一致性）**：未实现全局 PTZ 物理动作互斥（仅 `find_target_tool` 内部串行）。  
+  - 位置：[ptz-camera.tool.provider.ts](/opt/ai/src/chatbot/tools/ptz-camera.tool.provider.ts#L335)  
+  - 影响：并发请求下，`move_to_preset_tool` / `camera_zoom` 仍可能互相打架，不满足“物理动作必须串行”的强约束。
+
+3. **是否可以编译启动服务测试**  
+- **编译：可以**。我已执行 `npm run build`，通过。  
+- **启动：进程可拉起，但不建议直接做 PTZ 功能联测**。  
+  - `npm run start` 可启动进程，但由于上面的阻断级分发问题，新增 PTZ 工具链路不完整，PTZ 场景测试结果会失真。  
+  - 建议先修复分发逻辑，再做联调。
+
+阻断级：camera_zoom 仍会走错 Provider，联调会失败
+文件：multi-agent-graph.ts (line 916)
+问题：executeToolCalls 里先判断 toolName.startsWith("camera")，会把 camera_zoom 误判到 cameraToolProvider，导致找不到 PTZ 工具。
+同样问题在：multi-agent-graph.ts (line 1584) 的 executeSingleToolCall 里也存在。
+影响：camera_zoom 工具调用无法正确执行，联调不建议开始。
+
+
+四、解决方案：
+
+下面给你一套“从根上解耦普通 camera 与 ptz camera”的改法。  
+核心思想：**不要再靠工具名字符串前缀分发 provider**，统一改为 **`device-mappings` 的业务归属分发**（`getIntentForTool`）。
+
+## 现存问题
+1. 当前分发逻辑仍包含 `toolName.startsWith("camera")`，`camera_zoom` 会被误分到普通 camera provider。  
+2. 分发逻辑在两个地方重复，后续改一处漏一处，持续引入冲突风险。
+
+---
+
+## 改动 1（新增统一分发方法）
+文件：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)  
+位置：**L880 前后**（在 `ptzFindTarget` 下方、`executeToolCalls` 上方新增）
+
+更改前代码块：
+```ts
+  private async ptzFindTarget(state: GraphState) {
+    return this.executeToolCalls(state, "find_target_tool");
+  }
+
+
+  /**
+   * 通用工具执行
+   */
+  private async executeToolCalls(state: GraphState, toolName: string) {
+```
+
+更改后代码块：
+```ts
+  private async ptzFindTarget(state: GraphState) {
+    return this.executeToolCalls(state, "find_target_tool");
+  }
+
+  private async getToolsByOwnership(
+    toolName: string,
+    userId: string,
+    language: ChatbotSupportedLanguage,
+  ): Promise<StructuredToolInterface[]> {
+    const intentType = getIntentForTool(toolName);
+
+    if (intentType === "camera") {
+      return this.cameraToolProvider.generateCameraTools(
+        userId,
+        toPrismaLanguage(language),
+      );
+    }
+
+    if (intentType === "ptz_camera") {
+      return this.ptzToolProvider.generatePtzTools(
+        userId,
+        toPrismaLanguage(language),
+      );
+    }
+
+    if (intentType === "unknown") {
+      this.logger.warn(
+        `[ToolDispatch] Unknown tool ownership: ${toolName}, fallback to control provider`,
+      );
+    }
+
+    return this.toolProvider.generateControlTools(userId);
+  }
+
+  /**
+   * 通用工具执行
+   */
+  private async executeToolCalls(state: GraphState, toolName: string) {
+```
+
+更改后解决了什么问题：
+- 把“普通 camera / PTZ camera”分发规则集中到一个方法，彻底摆脱名称前缀耦合。  
+- 后续新增 PTZ 或 camera 工具时，只要更新 `device-mappings`，无需再改多处分发 `if-else`。
+
+---
+
+## 改动 2（executeToolCalls 改为调用统一分发）
+文件：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)  
+位置：**L913-L940**
+
+更改前代码块：
+```ts
+            // 根据工具名选择工具提供者
+            let tools: StructuredToolInterface[];
+            if (
+              toolName.startsWith("camera") ||
+              toolName === "get_camera_snapshot" ||
+              toolName === "list_cameras"
+            ) {
+              tools = await this.cameraToolProvider.generateCameraTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else if (
+                toolName.startsWith("ptz_") ||
+                toolName === "move_to_preset_tool" ||
+                toolName === "camera_zoom" ||
+                toolName === "capture_frame_tool" ||
+                toolName === "analyze_image_tool" ||
+                toolName === "find_target_tool"
+            ) {
+              tools = await this.ptzToolProvider.generatePtzTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else {
+              tools = await this.toolProvider.generateControlTools(
+                state.userId,
+              );
+            }
+```
+
+更改后代码块：
+```ts
+            // 按业务归属分发工具提供者，避免 camera / ptz 命名冲突
+            const tools = await this.getToolsByOwnership(
+              toolName,
+              state.userId,
+              state.language,
+            );
+```
+
+更改后解决了什么问题：
+- `camera_zoom` 不会再因名字包含 `camera` 被错误分发到普通 camera provider。  
+- 分发逻辑与业务归属绑定，命名冲突不再影响执行。
+
+---
+
+## 改动 3（executeSingleToolCall 同步改为统一分发）
+文件：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)  
+位置：**L1587-L1613**
+
+更改前代码块：
+```ts
+      // 根据工具名选择工具提供者
+      let tools: StructuredToolInterface[];
+      const toolName = toolCall.toolName;
+      if (
+        toolName.startsWith("camera") ||
+        toolName === "get_camera_snapshot" ||
+        toolName === "list_cameras"
+      ) {
+        tools = await this.cameraToolProvider.generateCameraTools(
+          userId,
+          toPrismaLanguage(language),
+        );
+      } else if (
+        toolName.startsWith("ptz_") ||
+        toolName === "move_to_preset_tool" ||
+        toolName === "camera_zoom" ||
+        toolName === "capture_frame_tool" ||
+        toolName === "analyze_image_tool" ||
+        toolName === "find_target_tool"
+      ) {
+        tools = await this.ptzToolProvider.generatePtzTools(
+          userId,
+          toPrismaLanguage(language),
+        );
+      } else {
+        tools = await this.toolProvider.generateControlTools(userId);
+      }
+```
+
+更改后代码块：
+```ts
+      const toolName = toolCall.toolName;
+      const tools = await this.getToolsByOwnership(
+        toolName,
+        userId,
+        language,
+      );
+```
+
+更改后解决了什么问题：
+- 复合任务执行路径和普通执行路径使用同一套分发规则，避免双实现漂移。  
+- camera / ptz 彻底解耦，不再由字符串前缀耦合。
+
+---
+
+如果你按上面 3 处改完，`camera` 与 `ptz_camera` 的冲突会从架构层被消除，后续只维护 `device-mappings` 即可。
+
+
+五、最终静态测试结论
+已完成“最终联调前静态检查”（7 个改动文件 + 编译验证）。
+
+**检查结论**
+1. 代码层面未发现新的阻断级缺陷。  
+2. 之前的阻断问题（`camera_zoom` 被错误分发到普通 camera provider）已修复，分发已改为业务归属分发：  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts#L880)  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts#L943)  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts#L1595)
+
+**编译结果**
+- `npm run build`：通过（无 TS 编译阻断）。
+
+**可联调性判断**
+- 可以进入最终联调。  
+- 仅提醒：运行时仍依赖环境（如 `OPENAI_API_KEY`、摄像头可达、`NGROK_URL` 可访问），这属于环境联调风险，不是静态阻断缺陷。
+
+
+六、多轮对话的ptz工具测试方案
+可以，按这个顺序最直观：
+
+1. `POST /chatbot/session/create`  
+Header: `user-id: u1001`  
+结果：拿到 `sessionId = s-abc-001`
+
+2. `POST /chatbot/session/command`  
+Header: `user-id: u1001`  
+Body:
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "帮我查一下云台1号通道支持哪些能力",
+  "language": "zh_CN"
+}
+```
+
+3. `POST /chatbot/session/command`（第二轮）  
+Header: `user-id: u1001`  
+Body:
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "看下1号通道现在云台状态",
+  "language": "zh_CN"
+}
+```
+
+4. `POST /chatbot/session/command`（第三轮）  
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "把摄像头转到3号预置位",
+  "language": "zh_CN"
+}
+```
+
+5. `POST /chatbot/session/command`（第四轮）  
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "镜头放大一点",
+  "language": "zh_CN"
+}
+```
+
+6. `POST /chatbot/session/command`（第五轮）  
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "抓拍一张当前画面",
+  "language": "zh_CN"
+}
+```
+
+7. `POST /chatbot/session/command`（第六轮）  
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "帮我分析刚才这张图里有什么",
+  "language": "zh_CN"
+}
+```
+
+8. `POST /chatbot/session/command`（第七轮）  
+```json
+{
+  "sessionId": "s-abc-001",
+  "command": "帮我看看外面有没有垃圾桶，没有就巡检预置位3到9",
+  "language": "zh_CN"
+}
+```
+
+关键点只有两个：
+- **一直用同一个 `sessionId`（s-abc-001）**
+- **一直用同一个 `user-id`（u1001）**
+
+你写的“`sessionID2+问题1`”不对，这里不会每轮换 sessionId。多轮就是同一个 sessionId 连续提问。

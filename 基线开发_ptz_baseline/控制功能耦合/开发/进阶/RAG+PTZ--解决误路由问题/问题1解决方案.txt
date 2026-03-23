@@ -1,0 +1,431 @@
+           #### ##目标## #####
+在进入现有 explicit compound -> RAG -> Router LLM 之前，先做一次 PTZ 片段识别：
+
+如果一句话里存在一个 PTZ 主片段
+该片段从 ptz/云台 类起点开始
+到 通道为1 / 1号通道 / channel 1 类终点结束
+那么这个片段整体强制标记为 ptz-only span
+在这个 span 内，即使出现 然后，也不参与 compound 拆分
+span 外仍按原有逻辑处理，然后 仍然是 compound keyword
+这和你现在的要求一致：然后 仍是复合词，但在 PTZ 强约束区间内失效；作用范围只限 PTZ。
+
+
+
+ 	 #### ##落地方案## #####
+一、定义一个 PTZ 强约束 Span 规则
+新增一个纯规则层概念，不改业务语义，只做“局部保护”。
+
+PTZ span start
+匹配以下起点词之一：
+
+云台
+ptz
+建议扩展但保持保守：
+
+扫描云台
+扫描ptz
+云台预置位
+ptz预置位
+PTZ span end
+匹配以下终点参数句之一：
+
+通道为\d+
+通道id为\d+
+\d+号通道
+channel \d+
+channel id = \d+
+PTZ span
+定义为：
+
+从命中起点的最早位置开始
+到命中终点的最晚位置结束
+中间所有文本都归属于同一个 PTZ 片段
+你的 3 个例子在这个定义下都会命中同一个 PTZ span：
+
+扫描云台所有预置位帮我找一下垃圾桶并截图给我，通道为1
+扫描ptz预置位找一下车并截图，1号通道
+扫描ptz所有预置位，然后截图给我，通道为1
+这 3 句都应直接产出：
+
+routeType = ptz
+isCompound = false
+intents = [{ type: "ptz", subCommand: 原始 span 文本 }]
+二、把“强约束”放在路由最前面，而不是改 compound 词表
+不要去删除 然后、,、帮我 这些现有关键词，否则会波及其他业务。
+
+正确做法是新增一个更高优先级的判断：
+
+优先级建议：
+
+PTZ span force-route
+显式 compound 检测
+RAG route
+Router LLM fallback
+也就是说：
+
+先检查整句是否存在“从 ptz/云台 到 通道为1”的闭合 span
+如果存在，直接短路返回 ptz
+后面的显式 compound、隐式 compound、Router LLM 都不再参与这句的拆分
+这样才能保证“不会拆分为复合指令”。
+
+三、明确边界：只保护闭合的 PTZ 片段
+为了不影响其他业务，强约束只在“起点 + 终点都存在”时生效。
+
+建议边界如下：
+
+生效条件：
+
+文本中存在 ptz/云台 起点
+文本中存在通道参数终点
+起点位置在终点位置之前
+不生效：
+
+只有 云台/ptz，没有通道参数
+只有 通道为1，没有 云台/ptz
+通道为1 出现在前面，ptz 在后面
+句子与 PTZ 无关，例如 开灯然后看前院，通道为1
+这样不会扩散到其他路由场景。
+
+四、对 然后 的处理方式
+这是这次方案的关键点。
+
+你要求：
+
+然后 仍然是 compound keyword
+但在 ptz/云台 -> 通道为1 这个区间内，不要拆
+因此规则要写成：
+
+然后 仍保留在全局 compound keywords 中
+但在执行 compound split 之前，先识别 PTZ protected span
+对 protected span 内部的 然后/并且/逗号 做“忽略拆分”
+span 外的 然后 仍按原逻辑拆分
+这意味着第 3 句：
+扫描ptz所有预置位，然后截图给我，通道为1
+虽然包含 然后，但因为它位于 PTZ protected span 内，整句仍然强制归 ptzAgent。
+
+而例如：
+
+扫描ptz所有预置位，通道为1，然后告诉我结果
+这里 PTZ span 到 通道为1 结束，后面的 然后告诉我结果 在 span 外，仍可参与 compound 或 general 路由。
+五、建议的数据形态
+不要只做布尔判断，建议产出结构化结果，方便后续接入现有 router。
+
+建议定义一个前置识别结果：
+
+matched: boolean
+startIndex: number
+endIndex: number
+protectedText: string
+channelClause: string
+reason: "ptz_span_force_route"
+如果命中：
+
+直接返回路由结果：
+routeType: "ptz"
+isCompound: false
+intents: [{ type: "ptz", subCommand: protectedText }]
+如果没命中：
+
+完全走现有逻辑，不做任何行为变化
+六、3 个例子的预期行为
+
+扫描云台所有预置位帮我找一下垃圾桶并截图给我，通道为1
+结果：
+命中 PTZ span
+整句强制 ptz
+不拆 compound
+扫描ptz预置位找一下车并截图，1号通道
+结果：
+命中 PTZ span
+整句强制 ptz
+不拆 compound
+扫描ptz所有预置位，然后截图给我，通道为1
+结果：
+命中 PTZ span
+虽然有 然后，但它在 protected span 内
+整句强制 ptz
+不拆 compound
+七、不会影响的场景
+以下逻辑保持原样：
+
+开灯然后看看门口
+还是 compound
+看看前院，然后截图给我
+还是 vision/general 现有逻辑
+云台状态是多少
+如果没有通道终点，不走这次强约束，仍按现有 PTZ 路由
+扫描ptz预置位，然后开客厅灯，通道为1
+这里需要额外明确产品策略：
+如果 开客厅灯 落在 ptz -> 通道 区间里，按你当前需求会被一起强制塞进 ptz
+这在业务上未必合理
+所以我建议再加一条保护：
+
+只有当 span 内不出现明显非 PTZ 设备控制词时，才触发强约束
+例如不包含：
+灯
+窗帘
+空调
+地暖
+场景
+音乐
+开关
+这样可以避免误吞家居控制业务。
+
+八、最终可执行落地方案
+不改代码前，方案可以先定成这 4 条：
+
+新增一个 PTZ 前置识别器，优先级高于 compound 检测。
+识别规则限定为：ptz/云台 起点 到 通道参数 终点 的闭合 span。
+命中后，span 内文本整体强制路由到 ptzAgent，isCompound=false。
+强约束只对 PTZ 生效，不修改全局 compound keywords，然后 在其他业务中保持原行为。
+推荐验收标准
+命中以下句式时，router 必须输出：
+
+routeType = ptz
+isCompound = false
+intents.length = 1
+覆盖用例：
+
+扫描云台所有预置位帮我找一下垃圾桶并截图给我，通道为1
+扫描ptz预置位找一下车并截图，1号通道
+扫描ptz所有预置位，然后截图给我，通道为1
+不命中用例：
+
+开灯然后看看门口
+看看前院，然后截图给我
+扫描ptz所有预置位，然后开客厅灯，通道为1
+如果你认可，我下一步可以基于这个方案，给你进一步细化成“改哪些文件、加哪些函数、每一步怎么验收”的实施设计，但仍然先不动代码。
+
+
+			#### 进一步优化方案  -- 本质：上下文约束保护 ####
+把“通道为1”写到系统预设内，而不是用户输入，提高用户指令的灵活性。
+二、推荐的设计原则
+你这次优化建议遵循 4 条原则：
+
+用户原始命令不改写
+只在命中 云台/ptz 时激活 PTZ 默认约束
+默认约束只作用于 PTZ 路由和 PTZ agent
+然后 这类 compound keyword 在全局仍然保留，不被改规则
+
+
+			### 落地方案 ###
+三、推荐的新机制：PTZ Session Constraint
+建议引入一个独立概念：
+
+PTZ session constraint
+或 PTZ default channel context
+其含义是：
+如果本轮用户命令命中了 ptz/云台，系统自动建立一个内部 PTZ 上下文，例如：
+
+ptzDetected = true
+defaultChannelId = "1"
+ptzConstraintSource = "system_default"
+然后后续所有“是否属于 PTZ 受控句”的判断，都基于这个内部上下文，而不是基于用户有没有显式说 通道为1。
+
+四、推荐的判定流程
+新的路由前置流程建议是这样：
+
+先扫描用户原文是否命中 PTZ 起点词
+匹配例如：
+云台
+ptz
+建议先不要放太宽，避免误召回。
+
+如果没命中 PTZ 起点词
+不做任何 PTZ 补充
+直接走原有路由逻辑
+如果命中 PTZ 起点词
+建立 PTZ 默认约束：channelId = 1
+把这条命令视为 PTZ protected command candidate
+对 PTZ protected command candidate 做强路由
+如果句子主体仍然围绕 PTZ 能力展开，例如：
+扫描预置位
+找目标
+截图
+查看 PTZ 画面/状态
+则直接：
+routeType = ptz
+isCompound = false
+注意，这里不需要用户再说 通道为1 作为终点了，因为终点已经被系统上下文接管。
+
+
+五、你这个方案的最大收益
+对以下用户说法都能统一处理为 PTZ：
+
+扫描云台所有预置位帮我找一下垃圾桶并截图给我
+扫描ptz预置位找一下车并截图
+查看云台所有预置位
+给我看看ptz预置位里有没有车
+扫描ptz所有预置位，然后截图给我
+它们都不再依赖用户补 通道为1。
+
+六、但必须加一个“PTZ 语义边界”
+这里是关键风险点。
+
+如果你只用“出现 云台/ptz 就整句强制归 PTZ”，会误吞一些混合命令，例如：
+
+查看云台状态，然后开客厅灯
+ptz转到1号位，然后关闭餐厅灯
+帮我看看ptz，再把窗帘关掉
+这些显然不能整体强制给 ptzAgent。
+
+所以必须再加一层约束：
+
+只有当 云台/ptz 后续内容仍属于 PTZ 语义域时，才整体强制归 PTZ。
+
+也就是说，建议把“出现 PTZ 起点词”分成两类：
+
+A. 纯 PTZ 任务
+例如：
+
+扫描预置位
+找车/找垃圾桶
+截图
+抓图
+变焦
+查询 PTZ 状态/能力
+这类可以整体强制给 ptzAgent
+
+B. PTZ + 非 PTZ 混合任务
+例如：
+
+然后开灯
+然后关窗帘
+然后播放音乐
+然后执行场景
+这类不能整体强制，仍应保留 compound
+
+所以你的新规则不能只是：
+
+“有 ptz/云台 就强制 PTZ”
+而应该是：
+
+“有 ptz/云台，且后续动作全集属于 PTZ 语义域，就强制 PTZ 并注入默认通道 1”
+
+
+
+		### 新的问题 ### -- 双归属语义冲突
+扫描ptz所有预置位，然后截图给我
+命中 PTZ trigger
+系统注入 channelId=1
+虽然有 然后，但两个动作都仍是 PTZ 域
+结果仍应：ptz, isCompound=false
+这种情况下会不会和如下case造成冲突？
+ptz camera和普通camera的复合指令：
+”扫描ptz所有预置位，然后截图给我“中”截图给我“被拆分成普通camera agent下的snapshot工具？
+如果不加额外约束，确实会出现你说的冲突：
+前半句被识别成 ptz
+后半句 截图给我 被现有规则/RAG/Router 识别成 vision/general
+最终又被拆成 compound
+
+
+		### 解决方案 ###
+
+当命令已进入 PTZ 受控语境时，截图/抓图/分析/找目标 这类视觉动作的归属优先级从 camera/vision 提升为 ptz。
+
+也就是要引入一个明确的判定：
+
+PTZ context + visual action => ptzAgent
+non-PTZ context + visual action => visionAgent
+这样才能避免冲突。
+
+建议的可执行方案
+
+1. 区分“视觉动作”与“视觉设备归属”
+不要把 截图 直接等同于 camera agent。
+应该拆成两层：
+
+动作类型：snapshot/analyze/find
+设备归属：
+当前上下文是 PTZ 设备 => 归 ptzAgent
+当前上下文是普通 camera => 归 visionAgent
+也就是说，截图给我 不是天然属于 visionAgent，它只是一个“视觉动作”，真正归谁取决于上下文设备域。
+
+2. 引入 PTZ 受控语境后的“动作归属重写”
+当一句话命中：
+
+云台|ptz
+且整体仍处于 PTZ 域任务中
+那么以下词都不再单独触发普通 camera 路由：
+
+截图
+抓图
+快照
+找一下
+分析
+识别
+看看
+在 PTZ 语境下，这些词应解释为：
+
+ptz capture
+ptz analyze
+ptz find target
+而不是普通 camera snapshot。
+
+3. 给 PTZ 域定义“合法后续动作集合”
+为了避免误吞普通 camera 任务，建议限定 PTZ 域内可吸收的动作：
+
+可并入 PTZ：
+
+扫描预置位
+转到预置位
+巡检
+找目标
+截图/抓图/快照
+分析画面
+变焦
+查询 PTZ 状态/能力
+不可并入 PTZ：
+
+查看门口摄像头
+列出所有摄像头
+普通 camera snapshot
+灯/窗帘/空调/音乐/场景
+这样：
+
+扫描ptz所有预置位，然后截图给我 => ptz
+扫描ptz所有预置位，然后看看门口摄像头 => compound
+扫描ptz所有预置位，然后列出所有摄像头 => compound
+4. 你的冲突案例要靠“设备上下文优先级”解决
+对这句：
+扫描ptz所有预置位，然后截图给我
+
+应该先形成一个设备上下文：
+
+当前 active device domain = ptz
+此时再解释后续 截图给我：
+
+不是“给任意摄像头截图”
+而是“对当前 PTZ 扫描结果/当前 PTZ 视角截图”
+所以它应强制落到 ptzAgent。
+
+而这句：
+
+看看前院，然后截图给我
+没有 PTZ 上下文
+所以 截图给我 才归普通 visionAgent
+5. 最稳妥的边界规则
+建议最终采用这条规则：
+
+若命令显式命中 ptz/云台
+且首个核心动作是 PTZ 动作（如扫描预置位/转预置位/查询 PTZ）
+且后续动作只包含 PTZ 允许的视觉后续动作（截图/找目标/分析）
+则整句强制归 ptzAgent，isCompound=false
+否则回退原有 compound 逻辑。
+
+这条规则能避免和普通 camera 冲突。
+
+6. 对你提的 case，推荐最终解释
+扫描ptz所有预置位，然后截图给我
+
+应该解释为：
+
+先执行 PTZ 扫描预置位
+再对 PTZ 扫描得到的目标视角截图
+两个动作都属于同一个 PTZ 工作流
+所以 routeType=ptz, isCompound=false
+不应该拆成：
+
+ptzAgent: 扫描预置位
+camera/visionAgent: 截图
+因为那样会丢失“截图对象是当前 PTZ 扫描视角”的上下文。

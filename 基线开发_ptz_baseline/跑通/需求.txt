@@ -1,0 +1,162 @@
+现在我要进行ptz camera的ai功能开发，开发边界限制制在/opt/ai/src内，我现有如下开发想法，根据想法和现有项目结构(ai开发所需的文件部分)分析合理和正确性并写一个开发方案。要求：专业开发工程师水准，但是方案要适合新手理解。方案中给出更改位置。 
+
+##开发想法##
+
+
+1. 新增一个“PTZ Agent”，在 LangGraph 多 agent 框架里和 Vision/HomeControl 并列。
+
+你需要改/加的范围通常是这些（从少到多）：
+
+2. Tools 层（新增，不动普通 camera）
+新增：src/chatbot/tools/ptz-camera.tool.provider.ts 
+修改注册：src/chatbot/tools/tool.module.ts（把 Ptz provider 加进 providers）
+3. Context Builder 层（新增一个 PTZ 上下文构建器，避免污染 Vision Prompt）
+新增：src/chatbot/context-builder/ptz-context.builder.ts 
+修改工厂：src/chatbot/context-builder/context-builder.factory.ts（让它能 buildContext("ptz", …)）
+修改类型：src/chatbot/context-builder/context-builder.interface.ts（RouteType/IntentType 增加 "ptz"）
+修改 Router：src/chatbot/context-builder/router-context.builder.ts（意图 schema + prompt 增加 ptz）
+4. LangGraph 层（真正“并行”的关键） 
+multi-agent-graph.ts
+buildGraph 里新增 ptzAgent 节点
+新增 PTZ 工具执行节点（例如 ptzMove/ptzZoom/ptzStop）
+routeFromRouter、getAgentNodeName 加上 ptz
+executeToolCalls 里识别 PTZ 工具应该用哪个 provider 生成工具
+映射/路由层（让工具名能映射到节点）
+5. device-mappings.ts 
+新增一个 mapping：type 可以叫 "ptz_camera"（或你自定义），tools 对应 ptz_*，nodeNames 对应 ptzMove 等
+RAG 工具库（让 RAG 能建议/门控 PTZ 工具，避免 LLM 乱用）
+tools_v2.json
+增加 PTZ 工具定义（embedding_text / example_queries 很关键）
+
+这个方案的好处：普通 camera 继续走 vision agent（看图/分析图）；PTZ 控制走 ptz agent（移动/变焦/预置位），两边 prompt、工具、节点完全分开，互不污染，而且 compoundExecutor 天然支持并行执行（“看看门口 + 转向左边”可以真并发）。
+
+
+
+3) 普通 camera 用普通接口；PTZ 用不同接口，怎么实现最好？
+核心原则就两条：接口封装分离 + 工具命名分离。
+
+Step 1：HTTP 封装分离（不要复用普通 camera 的方法名）
+你有两种做法：
+
+做法 1（更“完全分离”】【推荐】）：新增一个专门的 HTTP client service
+例如新增 src/http-client/ptz-http-client.service.ts（结构照着 HttpClientService 写，复用同一套 header 逻辑/配置项），提供类似：
+getPtzCameraMetadata(userId)
+ptzMove(cameraId, pan, tilt, speed, userId)
+ptzZoom(cameraId, levelOrDelta, userId)
+ptzStop(cameraId, userId)
+ptzGotoPreset(cameraId, presetId, userId)
+ 
+Step 2：工具命名分离（强烈建议加前缀）
+普通 camera 已经占了 list_cameras / get_camera_snapshot。
+
+PTZ 建议用独立名字，避免：
+
+MultiAgentGraph 的路由误判
+LLM 以为 PTZ 和普通 camera 是同一个工具
+你后面维护时工具含义不清
+例如：
+
+ptz_list_cameras
+ptz_move_camera
+ptz_zoom_camera
+ptz_stop_camera
+ptz_goto_preset
+Step 3：LangGraph 路由隔离（让不同工具走不同节点/不同 provider）
+你现在 Vision 工具的执行是走 cameraToolProvider.generateCameraTools(...)（见 multi-agent-graph.ts:620-707）。
+PTZ 也应该有自己的 ptzToolProvider.generatePtzTools(...)，并且在 graph 里给 PTZ 工具单独的节点/执行分支。
+
+你下一步该怎么做（最短上手路线）
+先列出 PTZ 后端接口清单（路径 + method + 入参 + 返回）
+我就能把“工具 schema + graph wiring + RAG tools_v2”这套完整落地步骤写得非常具体。下面是我想实现的基线ptz camera后端接口清单：
+
+
+GET /ISAPI/PTZCtrl/channels/<ID>/capabilities
+GET /ISAPI/PTZCtrl/channels/<ID>/status
+我想先只用这两个接口做基线，接口格式仿照：
+/opt/ai/src/http-client/下定义的普通camera工具调用的接口写法(getmetadata, snapshot之类的接口)
+
+
+
+##测试想法##
+
+中文
+
+不完全是。
+
+你现在这两条直测（capabilities + status）只能证明三件事：
+	1.	网络链路 OK：Ubuntu 能到 172.16.10.202:80
+	2.	鉴权 OK：Digest 用户名密码正确
+	3.	PTZ 读取 OK：channels/1 可读（capabilities/status）
+
+但如果你要说“通过对话路由实现（聊天→路由→PTZ工具调用）业务开发成功”，还必须再满足对话链路侧的验证，至少要证明：
+
+✅ A. 路由能命中 PTZ（不是 general）
+
+你的日志之前显示：
+	•	confidence=low tools=[]，最后 fallback 到 general
+这代表 PTZ 工具根本没被选中。
+
+你需要看到类似下面的日志（示例）：
+	•	routeType=ptz / intents 包含 ptz
+	•	tools 里出现你的 ptz tool（或 ptz service）
+	•	实际发起了 GET /ISAPI/PTZCtrl/...
+
+✅ B. 工具调用确实发生并成功
+
+也就是在日志里能看到（或你自己加日志）：
+	•	PtzHttpClientService.getPtzStatus(channelId=1) 被调用
+	•	返回 success=true 或 status 200，并把 XML/解析结果回传给对话
+
+✅ C. 对话端返回内容正确
+
+最终 /chatbot/session/command 的 response 中：
+	•	有 PTZ 状态信息（哪怕先原样 XML 返回也行）
+	•	不是“抱歉，处理您的请求时出现错误”
+	•	也不是走 general 的闲聊答案
+
+⸻
+
+你现在这种情况的关键点
+
+你在国内无法用 OpenAI LLM，所以“对话路由”想要成功，必须满足其中之一：
+	1.	RAG/规则/意图识别能直接命中 PTZ（不依赖 LLM）
+或
+	2.	即便走 Router LLM fallback，也要换成本地可用 LLM（否则必超时/Abort）
+
+你日志里报的 LangSmith 和外网连接超时，是另一个问题：会导致 router 流程变慢甚至 abort，但它不是 PTZ 本身的问题。
+
+⸻
+
+最小“成功标准”（我建议你按这个验收）
+
+只要达到下面 3 条，就可以算“对话路由实现 PTZ 成功”：
+	1.	用户发一句：“查看ptz信息”
+	2.	服务日志明确显示：命中了 PTZ 路由并调用了 PtzHttpClientService
+	3.	返回给客户端的内容里能看到：PTZ status（azimuth/elevation/zoom）
+
+你现在已经完成了 PTZ 接口层的 50%（网络+鉴权+可读）。
+另一半是“路由/工具编排”链路。
+
+⸻
+
+English
+
+Not entirely.
+
+Your successful direct tests (capabilities/status) prove:
+	1.	Network connectivity to the camera is OK
+	2.	Digest auth works
+	3.	PTZ read endpoints work for channels/1
+
+But to call it “conversation routing works,” you must also prove:
+	•	The router actually selects the PTZ route/tool (not fallback to general)
+	•	The PTZ service is invoked and returns success
+	•	The chatbot command response contains PTZ status data
+
+Since you can’t use OpenAI LLM in China, routing must work without that fallback (rule/RAG intent), or you need a local LLM.
+
+⸻
+
+如果你愿意，我可以给你一个**“不依赖 LLM 的最简单路由方案”**：
+识别关键字（ptz/云台/变焦/查看ptz）→ 直接调用 getPtzStatus("1") → 返回结果。
+这样你在国内也能稳定跑通对话链路。

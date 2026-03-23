@@ -1,0 +1,50 @@
+**先跑通版（MVP）简化方案**
+
+## 第一阶段：先跑通（只做必要改动）
+目标：`find_target_tool` 能稳定完成“移动→抓拍→分析→返回结果”。
+
+1. 保留现有 5 个工具函数签名不变  
+`move_to_preset_tool(presetId)`、`camera_zoom(level)`、`capture_frame_tool()`、`analyze_image_tool(arg)`、`find_target_tool(arg)`。
+
+2. 先统一返回风格（最重要）  
+- 成功：保持当前可读字符串或 JSON 字符串。  
+- 失败：统一返回 `{"error":"..."}`（可加 `preset/step/reason`）。  
+这样上层一次解析就够了。
+
+3. 只保留一套预设位移动逻辑  
+你现在有 `_impl_move_to_preset` 和 `move_to_preset_tool` 两套实现，先收敛成“一处真实逻辑 + 另一处调用它”，避免行为不一致（等待 2s/3s 不一致）。
+
+4. 补齐超时的最小闭环  
+`requestWithTimeout` 必须真正把超时信号传给请求（否则超时不生效）。  
+- 摄像头请求：8s  
+- URL 探测：5s
+
+5. 巡检流程先用“串行移动 + 并发分析（简化版）”  
+- 移动/抓拍严格串行（满足物理动作不能并行）。  
+- 每抓拍一张就立刻提交分析任务（满足“立即并行提交”）。  
+- 命中后停止继续移动新预设位（早停）。  
+- 已提交任务做结果回收，避免漏结果。
+
+6. 保留默认配置回退  
+继续用你现有 `CAM_IP/CAM_USER/CAM_PASS/NGROK_URL/OPENAI_API_KEY` 默认值，保证缺省可启动。
+
+7. main 入口按你现有方式保留  
+输出结果与耗时；异常 `process.exit(1)`，满足 CI/CD 可识别。
+
+---
+
+## 第二阶段：再优化（跑通后再做）
+1. 分层成 `PtzService/CaptureService/VisionService/InspectionOrchestrator`。  
+2. 把所有工具返回改成统一 JSON 字符串（成功/失败都结构化）。  
+3. 增加更严格类型、错误码、日志 traceId。  
+4. 优化并发池（任务取消、优先级、限流策略）。
+
+---
+
+## 你当前代码下的“必改优先级”
+1. 统一错误返回格式。  
+2. 合并两套 move 逻辑。  
+3. 修正超时机制。  
+4. 调整 `find_target_tool` 为“抓拍后立即提交分析 + 早停 + 回收”。
+
+按这个顺序做，能最快满足需求且风险最低。

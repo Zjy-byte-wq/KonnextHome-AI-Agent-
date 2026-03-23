@@ -1,0 +1,68 @@
+1.RAG部分综述
+●AI 服务：/opt/ai 分支 rag-merge 已部署
+●主服务可用（AI 通过 MAIN_PROGRAM_URL 拉取设备数据）
+●DB 已有 RAG 相关表（3 个库 + 2 个缓存）： 
+○位置库：document_embeddings_shared
+○控制库：document_embeddings_control
+○视觉库：document_embeddings_vision
+○同义词缓存：synonym_cache
+○查询缓存：query_cache
+●环境变量： 
+○OPENAI_API_KEY 可用（首次 seed / 首次检索可能需要）
+○CHATBOT_ADMIN_TOKEN 已配置（用于 seed 接口）
+
+2. 一次性初始化/种子化
+1.静态 KB（device_type + tool）
+●POST /chatbot/seed/static（Header：x-admin-token）
+2.动态数据（建议按顺序）
+●POST /chatbot/seed
+3. 命令覆盖测试
+3.1 快速路径
+用例	命令	期望
+greeting	你好 / 早上好 / hello / hi	不走 RAG/不调用工具；正常回复
+3.2 简单指令
+用例	命令	期望
+short-control	开灯 / 关灯	若存在默认位置（上文刚提到某区域）则使用默认位置；否则追问“哪个区域/房间”
+short-control	打开 / 关掉	若无明确对象，必须追问（避免误操作）
+short-vision	看看 / 查看	若未提到摄像头/室外位置，优先追问“要看哪个摄像头/哪里”
+3.2 控制域（home_control）常见设备
+用例	命令	期望工具（至少）
+light	打开客厅灯	control_home_light
+light	客厅灯亮一点	control_home_light（brightness 相对值）
+curtain	拉开窗帘	control_home_curtain
+aircon	关闭主卧空调	control_home_aircon_station（关机不带 mode/speed/temp）
+aircon	主卧空调调到 24 度	control_home_aircon_station
+floor heating	打开客厅地暖	control_home_floor_heating 或 control_home_simple_floor_heating
+scene	执行 All Off / 执行看电视场景	control_home_scene
+music	在客厅播放背景音乐	music_play
+music	暂停音乐 / 继续播放 / 停止音乐	music_control
+3.3 vision
+用例	命令	期望工具（至少）
+camera list	有哪些摄像头	list_cameras
+camera snapshot	看看门口摄像头 / 查看客厅监控	get_camera_snapshot（返回 cloudUrl 可打开）
+camera collage	把前院和后院都给我看看	get_camera_snapshot（cameraIds>=2 或 frameCount>=2）
+3.4 同义词
+用例	命令	期望
+area synonyms	打开大厅的灯 / 打开起居室的灯	命中对应区域并控灯
+scene synonyms	执行晚安模式 / 启动睡眠模式	命中对应场景并触发
+3.5 上下文缺失补全说明：主要用 lastLocation 做位置注入。
+步骤	命令	期望
+1	打开客厅灯	成功控灯（建立上下文）
+2	调亮一点	默认理解为客厅灯相关（命中/执行更稳定）
+3.6 复合命令（显式/隐式）
+用例	命令	期望
+显式复合（跨领域）	开灯，顺便看看门口	同时完成控制+摄像头（通常会有多次工具调用）
+显式复合（同领域）	打开客厅灯并拉开窗帘	同时完成两类控制（灯+窗帘）
+隐式复合（跨领域）	打开客厅灯看看门口	即使没有“顺便/并且”等连接词，也应尽量识别为两件事分别处理（不应只做其中一个）
+隐式复合（跨领域）	开灯帮我看看前院	同上（控制+摄像头）
+3.7 歧义与追问（避免误操作）
+用例	命令	期望
+ambiguous	打开灯（家里多区域）	追问“哪个区域/房间”或使用会话默认位置（不跨区域乱开）
+incomplete	调一下窗帘	追问 open/close/percentage（不直接执行）
+
+4. 缓存覆盖
+场景	操作	期望
+query_cache 命中	连续两次发送同一句：打开客厅灯	第二次更快，日志 Cache: true 或 DB query_cache.hit_count 自增
+语义相似命中	打开客厅灯 → 开客厅的灯	可能命中（阈值 0.95；未命中也可接受但需记录）
+synonym_cache 命中	seed 后重启/再 seed	Synonym cache hits > 0（不应每次都调 GPT）
+

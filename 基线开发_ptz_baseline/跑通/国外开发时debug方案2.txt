@@ -1,0 +1,535 @@
+1. 查询ptz状态
+1|konnext-ai   | [2026-03-07 10:49:35.307 +1100] INFO: Request DTO: {"sessionId":"60e6af3d-af92-461c-b48f-3243d9580008","command":"查询当前ptz状态，通道id为1","language":"zh_CN"}
+1|konnext-ai   | [2026-03-07 10:49:35.307 +1100] INFO: Processing command in session 60e6af3d-af92-461c-b48f-3243d9580008: 查询当前ptz状态，通道id为1
+1|konnext-ai   | [2026-03-07 10:49:35.377 +1100] INFO: [Router] Starting for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "查询当前ptz状态，通道id为1"
+1|konnext-ai   | [2026-03-07 10:49:35.380 +1100] INFO: [CommandPreprocessor] Detected explicit compound: "，", split into 2 sub-commands: ["查询当前ptz状态", "通道id为1"]
+1|konnext-ai   | [2026-03-07 10:49:41.556 +1100] DEBUG: [EmbeddingCache MISS] "查询当前ptz状态..." - stored
+1|konnext-ai   | [2026-03-07 10:49:41.628 +1100] INFO: [UnifiedSearch] "查询当前ptz状态..." 6246ms | Control: 0 (-) | Vision: 0 (-) | Location: 0 | Device: 0 | Fallback: true | Cache: false
+1|konnext-ai   | [2026-03-07 10:49:41.629 +1100] INFO: [DualKBRoute] "查询当前ptz状态..." | Control: no(0.00) | Vision: no(0.00) | Compound: false | Agent: ptz | Time: 6246ms
+1|konnext-ai   | [2026-03-07 10:49:41.632 +1100] INFO: [IntentService] Query: "查询当前ptz状态..." → Primary: ptz_camera(0.90), Secondary: [query], Fallback: false, Time: 0.9ms
+1|konnext-ai   | [2026-03-07 10:49:41.632 +1100] INFO: [IntentService] Primary: ptz_camera(0.90), Secondary: [query], Fallback: false
+1|konnext-ai   | [2026-03-07 10:49:41.632 +1100] INFO: [IntentService] Suggested tools: ptz_get_capabilities, ptz_get_status
+1|konnext-ai   | [2026-03-07 10:49:41.650 +1100] INFO: [Route] "查询当前ptz状态..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=6268ms
+1|konnext-ai   | [2026-03-07 10:49:41.651 +1100] INFO: [Factory] Compound task: [ptz, general], time=6274ms
+1|konnext-ai   | [2026-03-07 10:49:41.651 +1100] INFO: [Router] Completed in 6274ms: routeType=ptz, isCompound=true, intents=[ptz,general]
+1|konnext-ai   | [2026-03-07 10:49:41.671 +1100] INFO: [Router] Compound task detected with 2 intents: [ptz, general], routing to compoundExecutor
+1|konnext-ai   | [2026-03-07 10:49:41.692 +1100] INFO: [CompoundExecutor] Processing 2 intents in parallel: [ptz, general]
+1|konnext-ai   | [2026-03-07 10:49:41.693 +1100] INFO: [CompoundExecutor] Starting agent task 1/2: intent=ptz, agent=ptzAgent
+1|konnext-ai   | [2026-03-07 10:49:41.693 +1100] INFO: [CompoundExecutor] Agent ptzAgent using subCommand: "查询当前ptz状态"
+1|konnext-ai   | [2026-03-07 10:49:41.693 +1100] INFO: [PtzContext] Building for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "查询当前ptz状态"
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-07 10:49:41.693 +1100] DEBUG: Tool description cache hit for: ptz_get_capabilities_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 10:49:41.693 +1100] DEBUG: Tool description cache hit for: ptz_get_status_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 10:49:41.695 +1100] INFO: [PtzContext] Built in 2ms, tools: 2, messages: 0
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-07 10:49:43.614 +1100] INFO: 💰 [compoundExecutor-ptzAgent] Cost: $0.000732, Tokens: 245+12
+1|konnext-ai   | [2026-03-07 10:49:43.614 +1100] INFO: [CompoundExecutor] Agent ptzAgent completed in 1921ms: toolCalls=0, success=0, fail=0
+1|konnext-ai   | [2026-03-07 10:49:46.457 +1100] DEBUG: [MergeResponses] Agent ptzAgent: response="请提供要查询的云台通道ID。..."
+
+LangSmith监控日志--见03/06/2026：11:49
+
+原因分析：
+结论先说：**PTZ agent 链路“部分打通”**，目前卡在“参数被拆分丢失”，所以没有触发 `ptz_get_status`，更没有进入 PTZ HTTP 调用层。
+
+1. 现象与根因
+1. 你的原始命令是 `查询当前ptz状态，通道id为1`，被预处理按逗号拆成两段：`查询当前ptz状态` + `通道id为1`。这在日志里已出现。
+2. 代码里确实把逗号当“显式复合词”并参与拆分，见 [command-preprocessor.ts:44](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts:44) 和 [command-preprocessor.ts:52](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts:52)。
+3. 拆分后，`ContextBuilderFactory` 对每个子句单独路由；`通道id为1` 这种参数片段很容易被判成 `general`，且默认会走 general fallback，见 [context-builder.factory.ts:335](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts:335)。
+4. 因为出现了 `ptz + general` 两个意图，被当成 compound，`ptzAgent` 只拿到子命令 `查询当前ptz状态`，见 [multi-agent-graph.ts:1175](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts:1175)。
+5. PTZ prompt 明确写了“没 channelId 就反问”，见 [ptz-context.builder.ts:22](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts:22)，所以模型输出“请提供通道ID”是符合当前设计的。
+6. `toolCalls=0`，没有 `tool used: ptz_get_status`，说明工具层未触发；自然也不会到 [ptz-camera.tool.provider.ts:125](/opt/ai/src/chatbot/tools/ptz-camera.tool.provider.ts:125) 和后续 HTTP client。
+
+2. LangSmith 建议从哪里看（按顺序）
+1. `router` 节点：先看输出里的 `isCompound/intents/subCommand`，确认是否被拆成 `ptz + general`，以及 `ptz` 子命令是否丢了 `channelId`。
+2. `compoundExecutor` 节点：看每个 agent 的输入命令，重点是 `ptzAgent using subCommand`。
+3. `compoundExecutor-ptzAgent-llm` 子运行：看 messages（user 最后一条是否只有“查询当前ptz状态”）和 `tool_calls`（此处应为空）。
+4. 若 `tool_calls` 为空，就不用再往工具节点查；若不为空，再看 `ptzGetStatus/ptzGetCapabilities` 节点和工具参数。
+5. 你这次截图里只有 `compoundExecutor-ptzAgent-llm`，没有 PTZ 工具节点，已经直接证明“未触发工具”。
+
+3. 是否打通 PTZ 全链路
+1. 已打通：入口 -> router -> compoundExecutor -> ptzAgent-llm。
+2. 未打通：ptzAgent-llm -> `ptz_get_status` tool -> `PtzHttpClientService` 外部 PTZ API。
+3. 判定依据：`toolCalls=0` + 无 `tool used: ptz_get_status` 日志。
+
+4. 解决方案方向（仅分析，不改代码）
+1. 拆分策略收敛：不要把“逗号+参数补充句”（如 `通道id为1`）当独立意图；应并入前一句同 agent 命令。
+2. 参数继承机制：在 explicit compound 后处理阶段，识别参数片段（channelId、deviceId、location 等）并回填给前一个非 general intent。
+3. PTZ agent 兜底提参：即使进入 compound，也可从原始整句或对话上下文提取 `channelId`，避免直接反问。
+4. 增加回归用例：`查询当前ptz状态，通道id为1`、`查云台能力，通道2`、`查询ptz状态，1号通道`，断言必须产生 `ptz_get_status(channelId=1)`。
+
+解决方案(按优先级)
+
+下面给你一个“先跑通，再优化”的最小改错方案，按优先级排好。
+
+## 1. P0（必须先做）：PTZ 子任务丢参数
+- 问题：复合任务时 `ptzAgent` 只拿 `subCommand`，`channelId` 在原句里但不在子句里时会丢失。
+- 目的：确保 `ptz_get_status` 能被触发，打通到 PTZ HTTP 层。
+
+改前文件与代码块：  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+// Step 1: 确定该 Agent 处理的命令
+const agentCommand = intent.subCommand || state.command;
+```
+
+改后文件与代码块（最小可用）：
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+// Step 1: 确定该 Agent 处理的命令
+let agentCommand = intent.subCommand || state.command;
+
+// PTZ兜底：如果子命令没有channel信息，但原句有，则回退到原句，避免参数丢失
+if (routeType === "ptz" && intent.subCommand) {
+  const subHasChannel = /(通道\s*(id|号)?\s*[:=]?\s*\d+|channel\s*id\s*[:=]?\s*\d+)/i.test(intent.subCommand);
+  const fullHasChannel = /(通道\s*(id|号)?\s*[:=]?\s*\d+|channel\s*id\s*[:=]?\s*\d+)/i.test(state.command);
+  if (!subHasChannel && fullHasChannel) {
+    agentCommand = state.command;
+  }
+}
+```
+
+优化后实现了什么：
+- 即使被拆成 `ptz + general`，PTZ 也能拿到 `channelId`，大概率直接出 `toolCalls>0`，进入 `ptz_get_status -> ptz-http-client`。
+
+---
+
+## 2. P1（建议紧接着做）：预处理把“参数补充句”错误拆分
+- 问题：`查询当前ptz状态，通道id为1` 被拆成两个子句，后句被路由成 general。
+- 目的：减少错误 compound，避免参数句独立成意图。
+
+改前文件与代码块：  
+[ command-preprocessor.ts ](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts)
+
+```ts
+const subCommands = this.splitCompoundCommand(trimmedCommand);
+// ...
+if (subCommands.length <= 1) {
+  // ...
+}
+```
+
+改后文件与代码块（先做简单规则，不复杂）：
+[ command-preprocessor.ts ](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts)
+
+```ts
+const subCommands = this.splitCompoundCommand(trimmedCommand);
+
+// 参数补充句兜底：如“..., 通道id为1”不作为复合命令拆分
+if (
+  subCommands.length === 2 &&
+  /^(通道\s*(id|号)?\s*(为|是|=|:)?\s*\d+|channel\s*id\s*(is|=|:)?\s*\d+)$/i.test(
+    subCommands[1].replace(/\s+/g, ""),
+  )
+) {
+  return {
+    hasExplicitCompound: false,
+    subCommands: [trimmedCommand],
+  };
+}
+
+if (subCommands.length <= 1) {
+  // ...
+}
+```
+
+优化后实现了什么：
+- 这类 PTZ 查询不再被拆坏，路由更稳定，减少 general 干扰。
+
+---
+
+## 3. P2（可选，低成本）：PTZ 提示词增强提参倾向
+- 问题：当前 prompt 偏“没 channel 就追问”，对“可从原句提取”的场景不够激进。
+- 目的：让模型更愿意直接提取 `channelId` 并调工具。
+
+改前文件与代码块：  
+[ ptz-context.builder.ts ](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts)
+
+```ts
+- If no channelId is provided, ask a clarifying question
+```
+
+改后文件与代码块：
+[ ptz-context.builder.ts ](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts)
+
+```ts
+- First extract channelId from the user command (e.g. "通道id为1", "1号通道", "channel 1")
+- If channelId can be inferred with high confidence, call tool directly
+- Ask a clarifying question only when channelId truly cannot be inferred
+```
+
+优化后实现了什么：
+- 降低“本可执行却反问”的概率，提升首轮成功率。
+
+---
+
+## 你可以这样验收（改完立刻看日志）
+1. 输入：`查询当前ptz状态，通道id为1`
+2. 期望日志关键点：
+- `compoundExecutor-ptzAgent` 中 `toolCalls=1`
+- 出现 `tool used: ptz_get_status channelId=1`
+- 出现 PTZ HTTP 请求结果日志（成功或明确错误码）
+
+如果你愿意，我下一步可以给你一份“最小回归用例清单”（3-5条）直接贴到你测试文档里。
+
+现有小风险：
+我看到的两个小风险（不影响先验证）
+
+P0 的 channel 正则偏窄
+multi-agent-graph.ts (line 1178) 只识别 :/=，不识别“通道id为1”“1号通道”。这会让 PTZ 回退触发率变低。
+
+日志可观测性不准
+multi-agent-graph.ts (line 1193) 仍按 intent.subCommand ? "subCommand" : "full command" 打印；即使已回退到原句，日志也可能显示 subCommand，排障时会误导。
+
+
+风险解决：
+下面给你“同样风格”的小风险修正方案，保持最小改动。
+
+## 1. 小风险A：PTZ channel 正则偏窄（P0增强）
+- 问题：只识别 `:`/`=` 形式，漏掉“通道id为1”“1号通道”“channel 1”。
+- 目的：提高 PTZ 参数回退命中率，减少误判为“缺少通道ID”。
+
+改前文件与代码块：  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+const subHasChannel = /(通道\s*(id|号)?\s*[:=]?\s*\d+|channel\s*id\s*[:=]?\s*\d+)/i.test(intent.subCommand);
+const fullHasChannel = /(通道\s*(id|号)?\s*[:=]?\s*\d+|channel\s*id\s*[:=]?\s*\d+)/i.test(state.command);
+```
+
+改后文件与代码块（最小增强）：
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+const channelPattern =
+  /(通道\s*(id|号)?\s*(为|是|=|:)?\s*\d+|\d+\s*号?\s*通道|channel\s*(id)?\s*(is|=|:)?\s*\d+)/i;
+
+const subHasChannel = channelPattern.test(intent.subCommand);
+const fullHasChannel = channelPattern.test(state.command);
+```
+
+优化后实现了什么：
+- 常见中文/英文口语表达都能识别，PTZ 回退到整句更稳定。
+
+---
+
+## 2. 小风险B：日志可观测性不准（排障增强）
+- 问题：日志来源标记只看 `intent.subCommand` 是否存在，没反映“已回退到整句”。
+- 目的：让链路排障时能一眼看出 PTZ 实际用了哪条命令。
+
+改前文件与代码块：  
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+this.logger.info(
+  `[CompoundExecutor] Agent ${agentName} using ${intent.subCommand ? "subCommand" : "full command"}: "${agentCommand}"`,
+);
+```
+
+改后文件与代码块（最小增强）：
+[ multi-agent-graph.ts ](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+```ts
+const commandSource =
+  !intent.subCommand
+    ? "full command"
+    : agentCommand === state.command
+      ? "full command (ptz fallback)"
+      : "subCommand";
+
+this.logger.info(
+  `[CompoundExecutor] Agent ${agentName} using ${commandSource}: "${agentCommand}"`,
+);
+```
+
+优化后实现了什么：
+- 日志能准确区分 `subCommand` 与 `ptz fallback`，复盘 LangSmith/服务日志时不会误判。
+
+
+2. 查询ptz能力--可以调用到接口，日志如下：
+1|konnext-ai   | [2026-03-07 20:55:54.651 +1100] INFO: [DualKBRoute] "当前云台有什么功能？channelid是1..." | Control: no(0.00) | Vision: no(0.00) | Compound: false | Agent: ptz | Time: 3905ms
+1|konnext-ai   | [2026-03-07 20:55:54.664 +1100] DEBUG: [IntentService] Boost rule "long_explicit_query" applied to ptz_camera: +0.05
+1|konnext-ai   | [2026-03-07 20:55:54.666 +1100] INFO: [IntentService] Query: "当前云台有什么功能？channelid是1..." → Primary: ptz_camera(0.95), Secondary: [query], Fallback: false, Time: 12.6ms
+1|konnext-ai   | [2026-03-07 20:55:54.667 +1100] INFO: [IntentService] Primary: ptz_camera(0.95), Secondary: [query], Fallback: false
+1|konnext-ai   | [2026-03-07 20:55:54.667 +1100] INFO: [IntentService] Suggested tools: ptz_get_capabilities, ptz_get_status
+1|konnext-ai   | [2026-03-07 20:55:54.690 +1100] INFO: [Route] "当前云台有什么功能？channelid是1..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=3946ms
+1|konnext-ai   | [2026-03-07 20:55:54.691 +1100] INFO: [Factory] PTZ explicit fast-path: confidence=low, time=3949ms
+1|konnext-ai   | [2026-03-07 20:55:54.691 +1100] INFO: [Router] Completed in 3949ms: routeType=ptz, isCompound=false, intents=[ptz]
+1|konnext-ai   | [2026-03-07 20:55:54.709 +1100] INFO: [Router] Single task, routing to: ptzAgent
+1|konnext-ai   | [2026-03-07 20:55:54.726 +1100] INFO: [PtzAgent] Processing for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83
+1|konnext-ai   | [2026-03-07 20:55:54.726 +1100] INFO: [PtzContext] Building for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "当前云台有什么功能？channelid是1"
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-07 20:55:54.727 +1100] DEBUG: Tool description cache miss for: ptz_get_capabilities_zh_CN, creating new description
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 20:55:54.728 +1100] DEBUG: Tool description cache miss for: ptz_get_status_zh_CN, creating new description
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 20:55:54.728 +1100] INFO: [PtzContext] Built in 2ms, tools: 2, messages: 0
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-07 20:55:56.413 +1100] INFO: 💰 [ptzAgent] Cost: $0.000922, Tokens: 297+18
+1|konnext-ai   | [2026-03-07 20:55:56.413 +1100] INFO: [ToolCall] ptz_get_capabilities args: {"channelId":"1"}
+1|konnext-ai   | [2026-03-07 20:55:56.443 +1100] INFO: Executing 1 ptz_get_capabilities tool calls
+1|konnext-ai   | [2026-03-07 20:55:56.444 +1100] DEBUG: Tool description cache hit for: ptz_get_capabilities_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 20:55:56.444 +1100] DEBUG: Tool description cache hit for: ptz_get_status_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 20:55:56.447 +1100] INFO: tool used: ptz_get_capabilities channelId=1
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-07 20:55:56.912 +1100] DEBUG: [AggregateResults] Updated context: location=undefined, deviceType=ptz_camera, targetName=undefined
+1|konnext-ai   | [2026-03-07 20:55:56.939 +1100] INFO: synthesize text: PTZ capabilities fetched.
+
+没有报错
+
+3. 复合提问获取status和capability（样例：你好kon，我想知道当前云台有什么功能，状态如何？通道是1）
+
+输出：你好！有什么我可以帮你的吗？
+
+你好！当前云台支持绝对位置和连续移动控制，最大预置点数为300，支持一键巡航和一键菜单等功能。当前状态是：仰角117，方位角456，变焦10。希望这些信息对你有帮助！如果还有其他问题，请随时告诉我。
+
+你好！我很好，谢谢你的关心。关于“通道是1”，你能提供更多信息吗？如果你想控制某个设备，请告诉我房间/位置、设备和动作。比如：
+
+- "关闭客厅的灯"
+- "打开厨房的电视"
+- "将卧室的空调设置为24°C"
+
+输出分析：
+结论：**功能上基本成功，但对话质量不算完全成功**。
+
+判断依据：
+1. 你要的两类信息都返回了  
+- `capability`：绝对位置、连续移动、预置点300、巡航/菜单  
+- `status`：仰角117、方位角456、变焦10  
+这说明 PTZ 双工具链路大概率都执行了。
+
+2. 但输出里混入了无关回复  
+- 第1句“你好！有什么我可以帮你的吗？”  
+- 第3句又把“通道是1”当成泛化设备控制引导  
+这说明多 Agent 合并或轮次处理里仍有 `general` 噪声，结果呈现不干净。
+
+所以：**链路成功，结果聚合/响应策略仍需优化**。  
+理想结果应是一条整合回复：同一条里同时给 capability + status，不再出现通用闲聊和错误引导(引起高噪声和高token消耗)。
+
+根因定位：
+(1) /opt/ai/src/chatbot/context-builder/context-builder.factory.ts
+for (let i = 0; i < subCommands.length; i++) {
+  const ragResult = ragResults[i];
+  let agentType: RouteType;
+
+  if (ragResult.agentType) {
+    agentType = ragResult.agentType;
+  } else if (ragResult.isImplicitCompound) {
+    // ...
+    agentType = llmResult.routeType;
+  } else {
+    agentType = "general";
+  }
+
+  agentTypes.add(agentType);
+  intents.push({
+    type: agentType,
+    subCommand: effectiveSubCommands[i],
+    ragRouteResult: ragResult,
+  });
+}
+原始代码块引发的问题：
+当子句是“状态如何？通道是1”这类“参数补充句”时，agentType 常为 null，被直接降级成 general，导致 channelId 与 PTZ 子句分离，最终出现 general + ptz + general 噪声结构。
+
+解决方案（最简洁版本）：
+
+
+改动内容1--“通道参数补充句”作为ptz子命令，而不是降级为general
+
+可以，给你“最简单先跑通版”，只改 **1 个文件 1 处逻辑** 就够了。
+
+1. 改动文件  
+[context-builder.factory.ts](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts)
+
+2. 改动位置  
+`handleExplicitCompound(...)` 里，`intents` 构建完成后、`agentTypes` 判定前。
+
+3. 直接加这段最小逻辑（把“通道=1”这类 general 子句并回 ptz）
+```ts
+// 最小兜底：如果有 PTZ 意图，把“通道参数句”从 general 并入 PTZ
+const channelPattern =
+  /(通道\s*(id|号)?\s*(为|是|=|:)?\s*\d+|\d+\s*号?\s*通道|channel\s*(id)?\s*(is|=|:)?\s*\d+)/i;
+
+const ptzIdx = intents.findIndex((i) => i.type === "ptz");
+if (ptzIdx >= 0) {
+  for (let i = intents.length - 1; i >= 0; i--) {
+    if (i === ptzIdx) continue;
+    const isGeneral = intents[i].type === "general";
+    const sub = intents[i].subCommand || "";
+    if (isGeneral && channelPattern.test(sub)) {
+      intents[ptzIdx].subCommand =
+        `${intents[ptzIdx].subCommand || ""} ${sub}`.trim();
+      intents.splice(i, 1);
+    }
+  }
+}
+```
+
+4. 为什么这是最简单且有效  
+- 不改现有路由大框架。  
+- 只修你当前核心问题：`channelId` 被拆到 general。  
+- 改完后 PTZ 子命令会带上“通道是1”，更稳定触发 `ptz_get_status / ptz_get_capabilities`。  
+- 还能减少你看到的 `general + ptz + general` 噪声组合。
+
+如果你愿意再加“第二个最小改动”，我建议再在 `compoundAggregator` 过滤掉明显闲聊型 `generalAgent` 响应。
+
+
+改动内容2--“问候句"作为噪声句应该被过滤掉
+
+根因分析：“噪声问题”大概率还没完全解决
+你的输入里有 你好kon，这段仍会保留为 general intent（补丁只并了“通道参数句”，没并“问候句”）。
+compoundAggregator 目前只过滤很少几类默认文案，中文寒暄噪声基本不会被过滤：
+
+解决方案：src/chatbot/langgraph/multi-agent-graph.ts中的私有类mergeAgentResponses
+const responses: string[] = [];
+
+// 如果本轮 PTZ 已有工具执行结果，优先保留 PTZ 结果，过滤 general 闲聊噪声
+const hasPtzToolResult = agentResults.some(
+  (r) => r.agentName === "ptzAgent" && (r.toolResults?.length || 0) > 0,
+);
+
+for (const result of agentResults) {
+  this.logger.debug(
+    `[MergeResponses] Agent ${result.agentName}: response="${result.response?.substring(0, 100)}..."`,
+  );
+
+  // 跳过空响应
+  if (!result.response || result.response.trim() === "") {
+    this.logger.debug(
+      `[MergeResponses] Agent ${result.agentName}: skipped (empty)`,
+    );
+    continue;
+  }
+
+  // 跳过默认/无效响应
+  const lowerResponse = result.response.toLowerCase();
+  if (
+    lowerResponse.includes("how can i assist") ||
+    lowerResponse.includes("hello!") ||
+    lowerResponse === "i understand your request." ||
+    result.response === "我理解了您的请求"
+  ) {
+    this.logger.debug(
+      `[MergeResponses] Agent ${result.agentName}: skipped (default response)`,
+    );
+    continue;
+  }
+
+  // 新增：PTZ结果已存在时，过滤 general 闲聊/引导
+  if (
+    hasPtzToolResult &&
+    result.agentName === "generalAgent" &&
+    /你好|有什么我可以帮你|请告诉我房间|设备和动作|how can i assist|tell me room|device and action/i.test(
+      result.response,
+    )
+  ) {
+    this.logger.debug(
+      `[MergeResponses] Agent ${result.agentName}: skipped (general noise while ptz result exists)`,
+    );
+    continue;
+  }
+
+  responses.push(result.response);
+}
+
+
+改动内容3--agentTypes重算问题
+
+问题分析：仍有一个静态小隐患（不一定影响你这条用例）
+在并入并 splice intents 后，没有重算 agentTypes，见 context-builder.factory.ts (line 306) 与 context-builder.factory.ts (line 373)。
+结果是流程可能仍走 compound（即使 intents 已变化），但不妨碍你这条请求跑通。
+
+问题定位：src/chatbot/context-builder/context-builder.factory.ts
+
+解决方案：
+按最小改动修这个隐患，直接做这 2 步。
+
+1. 在 `handleExplicitCompound` 里删除“过早维护”的 `agentTypes`
+文件：[`/opt/ai/src/chatbot/context-builder/context-builder.factory.ts`](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts)
+
+**改动前**
+```ts
+const intents: Intent[] = [];
+const agentTypes = new Set<RouteType>();
+
+for (let i = 0; i < subCommands.length; i++) {
+  // ...
+  agentTypes.add(agentType);
+  intents.push({
+    type: agentType,
+    subCommand: effectiveSubCommands[i],
+    ragRouteResult: ragResult,
+  });
+}
+```
+
+**改动后**
+```ts
+const intents: Intent[] = [];
+
+for (let i = 0; i < subCommands.length; i++) {
+  // ...
+  intents.push({
+    type: agentType,
+    subCommand: effectiveSubCommands[i],
+    ragRouteResult: ragResult,
+  });
+}
+```
+
+2. 在你做完 `intents.splice(...)` 之后，基于最终 intents 重新计算 `agentTypes`
+同文件，同函数，放在这段后面：
+```ts
+if (ptzIdx >= 0) {
+  for (let i = intents.length - 1; i >= 0; i--) {
+    // ...
+    if (isGeneral && channelPattern.test(sub)) {
+      intents[ptzIdx].subCommand =
+        `${intents[ptzIdx].subCommand || ""} ${sub}`.trim();
+      intents.splice(i, 1);
+    }
+  }
+}
+```
+
+**新增代码块**
+```ts
+// 关键修正：intents 可能已被 splice，需基于最终结果重算 agentTypes
+const agentTypes = new Set<RouteType>(
+  intents.map((intent) => intent.type as RouteType),
+);
+```
+
+这样后面这两处就会用“最新状态”：
+- `if (agentTypes.size === 1) { ... }`
+- `Compound task: [${[...agentTypes].join(", ")}]`
+
+这就是最小且正确的修复。
+
+
+总结：
+结论：**对你当前主诉场景，噪声问题已“基本充分解决”，但不是理论 100% 全场景解决。**
+
+基于你现有改动的静态判断：
+
+1. 参数补充句噪声  
+- 已处理：`general` 里的“通道是1”会并入 `ptz` 子命令。  
+- 对你的句子 `你好kon，我想知道当前云台有什么功能，状态如何？通道是1`，这部分能生效。
+
+2. 问候句噪声  
+- 已处理：`mergeAgentResponses` 在存在 PTZ 工具结果时，会过滤 `generalAgent` 的常见问候/引导文案。  
+- 你这类“你好kon + PTZ请求”大概率不会再把问候混到最终回复里。
+
+3. 剩余边界（仍可能有少量噪声）  
+- 如果 `general` 产出的噪声文案不在你当前正则关键词里，可能漏过滤。  
+- 如果 PTZ 本轮没有产生 `toolResults`（例如模型没调工具/工具异常），过滤条件不触发，`general` 噪声可能回流。
+
+最终判断：  
+- **就你当前问题与用例，已经足够上线验证。**  
+- 若要“彻底无噪声”，下一步是扩充 `general` 噪声正则或改成“当存在 ptz intent 时默认降权/忽略 general 输出”。
+

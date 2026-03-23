@@ -1,0 +1,425 @@
+你是一个专业的后端工程师，帮我分析问题所在：
+问题：用户指令：扫描云台所有预置位帮我找一下垃圾桶并截图给我，通道为1
+langsmith trace如图，router节点结果：
+{
+  "activeAgent": "ptz",
+  "routeResult": {
+    "intents": [
+      {
+        "ragRouteResult": {
+          "agentType": "ptz",
+          "confidence": "low",
+          "context": "=== LOCATION CONTEXT ===\nDetected area: Frontyard, Kitchen, Cabinet, Master, Breakfast Bar, Backyard, Dining\nRULE: For compound commands, apply this location to ALL actions unless explicitly overridden.\nExample: \"客厅放首歌，然后关灯\" → both \"play music\" AND \"turn off lights\" apply to 客厅/Living.\n\n=== EXACT AREA NAMES (Use in tool calls) ===\n- Backyard\n- Bedroom 1\n- Bedroom 2\n- Breakfast Bar\n- Cabinet\n- Dining\n- Entry\n- Family\n- Frontyard\n- Garage\n- Hallway\n- Kitchen\n- Living\n- Master\n- Study\n- Theatre\n- wine cabinet\n- 后院\n- 早餐吧\n- 餐厅\nRule: when calling tools, always use the exact area names above.\n\n=== DEVICE OPERATION RULE ===\nIMPORTANT: For lights, curtains, air conditioning, floor heating, and switches: use device ID in tool calls.\nFor music_play: use areaNames parameter with area names (e.g., [\"Living\", \"Family\"]).\nFor music_control: use playerId parameter from music player context (e.g., the ID shown in music players list).\nFormat below: [Area] DeviceName (ID: xxx-xxx) [Status]\n\nLights:\n  - [后院] 壁灯 (ID: cf2c2767-04c1-4987-9987-2d09ed8244f3) [OFF]\n  - [早餐吧] 灯 (ID: 8e95e42b-48b0-44f4-9047-68a56c2d29cd) [OFF]\n  - [餐厅] 吊灯 (ID: 9c630aab-e910-45d9-903c-1e7d65d8c2ab) [OFF]\n  - [餐厅] 射灯 (ID: e5584702-b528-4400-bde4-87c7de5c68eb) [OFF, brightness: 100%]\n\nScenes:\n  - mc_tv_to_family_sw_m_l (ID: 2c6e4b7e-2386-4347-89c0-5af344b3582a)\n  - mc_living_back_sw_m_s (ID: 8dc6c6ab-c0fe-4bd4-9452-fb0f6272cb84)\n  - mc_room_hallway_sw_1_l (ID: f18da450-5221-4092-b3f8-8ca52366c38e)\n  - 关酒柜门 (ID: 0d3cb58b-18b0-47b0-b3df-bf59cef18786)\n  - mc_living_back_sw_m_l (ID: 8e376e02-ac53-4b4d-b3e6-1d33a9c5aaee)\n  - bbc (ID: 1e0d37f9-ac9f-4453-9e1d-9f0b11e92f92)\n  - mc_room_hallway_sw_1_s (ID: 238cfffb-6a9c-4e99-8e54-d2c8b0c18045)\n  - mc_kitchen_3_s (ID: a7423223-78b1-4edb-9ad9-090bff706ad1)\n  - mc_family_to_kitchen_3_s (ID: 008ba81a-31ec-482b-9031-65667a42729c)\n  - mc_family_to_kitchen_3_l (ID: 7adbcca3-ea86-4fdb-ad1e-083f1da922ba)",
+          "fallbackUsed": false,
+          "isImplicitCompound": false,
+          "patterns": {
+            "areas": [
+              {
+                "aliases": [
+                  "Frontyard",
+                  "前院"
+                ],
+                "canonicalName": "Frontyard",
+                "score": 0.38290878268082107
+              },
+              {
+                "aliases": [
+                  "Kitchen",
+                  "厨房"
+                ],
+                "canonicalName": "Kitchen",
+                "score": 0.381104322144755
+              },
+              {
+                "aliases": [
+                  "Cabinet",
+                  "密室"
+                ],
+                "canonicalName": "Cabinet",
+                "score": 0.3782463088474384
+              },
+              {
+                "aliases": [
+                  "Master",
+                  "主卧"
+                ],
+                "canonicalName": "Master",
+                "score": 0.3732124272285078
+              },
+              {
+                "aliases": [
+                  "Breakfast Bar",
+                  "早餐吧",
+                  "Morning Buffet",
+                  "Brunch Counter",
+                  "AM Eatery",
+                  "Sunrise Snack Bar",
+                  "Dawn Diner",
+                  "Daybreak Dining",
+                  "Early Bird Café",
+                  "Morning Munch Spot",
+                  "First Light Lounge",
+                  "Sunup Snack Station",
+                  "Breakfast Nook",
+                  "Morning Meal Area",
+                  "AM Bistro",
+                  "Breakfast Counter",
+                  "Morning Bar",
+                  "早餐吧",
+                  "早晨自助餐",
+                  "早午餐柜台",
+                  "晨间小吃吧",
+                  "黎明餐厅",
+                  "晨曦餐饮",
+                  "早鸟咖啡馆",
+                  "晨间小吃点",
+                  "晨光休息室",
+                  "日出小吃站",
+                  "早餐角落",
+                  "晨间用餐区",
+                  "早晨小馆",
+                  "早餐柜台",
+                  "晨间吧台"
+                ],
+                "areaId": "ca82f511-ff38-4a37-953e-06c710f77f1a",
+                "canonicalName": "Breakfast Bar",
+                "floorId": "24b71423-2622-4077-83e3-74382fe3c012",
+                "score": 0.3661488554802561
+              },
+              {
+                "aliases": [
+                  "Backyard",
+                  "后院",
+                  "Backyard",
+                  "Garden",
+                  "Yard",
+                  "Outdoor Area",
+                  "Patio",
+                  "Courtyard",
+                  "Lawn",
+                  "Back Garden",
+                  "Terrace",
+                  "Deck",
+                  "Outdoor Space",
+                  "Rear Garden",
+                  "Back Lot",
+                  "Green Space",
+                  "Outdoor Yard",
+                  "后院",
+                  "花园",
+                  "庭院",
+                  "户外区域",
+                  "露台",
+                  "草坪",
+                  "后花园",
+                  "露天平台",
+                  "甲板",
+                  "户外空间",
+                  "后场",
+                  "绿地",
+                  "户外庭院",
+                  "后草坪",
+                  "后绿地"
+                ],
+                "areaId": "3d549969-4a23-4ef0-a10f-36c75f9d10c7",
+                "canonicalName": "Backyard",
+                "floorId": "8ba68900-c0e0-4d0f-bff6-7738445ab158",
+                "score": 0.3208850024360006
+              },
+              {
+                "aliases": [
+                  "Dining",
+                  "餐厅",
+                  "Dining Room",
+                  "Dining Area",
+                  "Eating Room",
+                  "Meal Room",
+                  "Banquet Room",
+                  "Feasting Room",
+                  "Dining Hall",
+                  "Lunch Room",
+                  "Dinner Room",
+                  "Dine-in Area",
+                  "Dining Space",
+                  "Dining Zone",
+                  "Dining Section",
+                  "D.R.",
+                  "Dine Area",
+                  "餐厅",
+                  "饭厅",
+                  "用餐区",
+                  "用餐室",
+                  "进餐区",
+                  "进餐室",
+                  "餐饮区",
+                  "餐饮室",
+                  "宴会厅",
+                  "宴会室",
+                  "食堂",
+                  "就餐区",
+                  "就餐室",
+                  "餐区",
+                  "饭区"
+                ],
+                "areaId": "77eac5b3-c556-46c3-9d01-69de9a3a563e",
+                "canonicalName": "Dining",
+                "floorId": "24b71423-2622-4077-83e3-74382fe3c012",
+                "score": 0.3070981143632936
+              }
+            ],
+            "deviceTypes": [
+              {
+                "dbMethods": {
+                  "metadata": "getSceneMetaData",
+                  "property": null
+                },
+                "deviceType": "scene",
+                "name": "Fully open",
+                "score": 0.3979113475757017,
+                "toolMapping": [
+                  "control_home_scene",
+                  "build_home_scene"
+                ]
+              },
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "light",
+                "name": "spotlight",
+                "score": 0.38290878268082107,
+                "toolMapping": "control_home_light"
+              },
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "uni_switch",
+                "name": "Screen",
+                "score": 0.381104322144755,
+                "toolMapping": "control_home_uni_switch"
+              }
+            ],
+            "floors": [],
+            "tools": []
+          },
+          "suggestedTools": [],
+          "topScore": 0.3979113475757017
+        },
+        "subCommand": "扫描云台所有预置位 通道为1",
+        "type": "ptz"
+      },
+      {
+        "ragRouteResult": {
+          "agentType": null,
+          "confidence": "low",
+          "context": "=== LOCATION CONTEXT ===\nDetected area: Kitchen, wine cabinet, Cabinet, Garage, Breakfast Bar\nRULE: For compound commands, apply this location to ALL actions unless explicitly overridden.\nExample: \"客厅放首歌，然后关灯\" → both \"play music\" AND \"turn off lights\" apply to 客厅/Living.\n\n=== EXACT AREA NAMES (Use in tool calls) ===\n- Backyard\n- Bedroom 1\n- Bedroom 2\n- Breakfast Bar\n- Cabinet\n- Dining\n- Entry\n- Family\n- Frontyard\n- Garage\n- Hallway\n- Kitchen\n- Living\n- Master\n- Study\n- Theatre\n- wine cabinet\n- 早餐吧\n- 车库\n- 酒柜\nRule: when calling tools, always use the exact area names above.\n\n=== DEVICE OPERATION RULE ===\nIMPORTANT: For lights, curtains, air conditioning, floor heating, and switches: use device ID in tool calls.\nFor music_play: use areaNames parameter with area names (e.g., [\"Living\", \"Family\"]).\nFor music_control: use playerId parameter from music player context (e.g., the ID shown in music players list).\nFormat below: [Area] DeviceName (ID: xxx-xxx) [Status]\n\nLights:\n  - [早餐吧] 灯 (ID: 8e95e42b-48b0-44f4-9047-68a56c2d29cd) [OFF]\n  - [车库] 灯 (ID: 94b9007b-6728-4aaa-9e46-177e19d8f535) [OFF]\n  - [酒柜] 灯 (ID: 8e4fc501-f54a-46e7-843a-11b4f2d3ccf4) [OFF]\n  - [酒柜] 雾化 (ID: ed5a9a9b-1591-473e-b455-a6ce84059a8e) [OFF]\n\nScenes:\n  - mc_tv_to_family_sw_m_l (ID: 2c6e4b7e-2386-4347-89c0-5af344b3582a)\n  - mc_living_back_sw_m_s (ID: 8dc6c6ab-c0fe-4bd4-9452-fb0f6272cb84)\n  - mc_room_hallway_sw_1_l (ID: f18da450-5221-4092-b3f8-8ca52366c38e)\n  - 关酒柜门 (ID: 0d3cb58b-18b0-47b0-b3df-bf59cef18786)\n  - mc_living_back_sw_m_l (ID: 8e376e02-ac53-4b4d-b3e6-1d33a9c5aaee)\n  - bbc (ID: 1e0d37f9-ac9f-4453-9e1d-9f0b11e92f92)\n  - mc_room_hallway_sw_1_s (ID: 238cfffb-6a9c-4e99-8e54-d2c8b0c18045)\n  - mc_kitchen_3_s (ID: a7423223-78b1-4edb-9ad9-090bff706ad1)\n  - mc_family_to_kitchen_3_s (ID: 008ba81a-31ec-482b-9031-65667a42729c)\n  - mc_family_to_kitchen_3_l (ID: 7adbcca3-ea86-4fdb-ad1e-083f1da922ba)",
+          "fallbackUsed": false,
+          "isImplicitCompound": false,
+          "patterns": {
+            "areas": [
+              {
+                "aliases": [
+                  "Kitchen",
+                  "厨房"
+                ],
+                "canonicalName": "Kitchen",
+                "score": 0.3359578774557298
+              },
+              {
+                "aliases": [
+                  "wine cabinet",
+                  "酒柜",
+                  "wine cellar",
+                  "wine storage",
+                  "wine closet",
+                  "wine vault",
+                  "wine room",
+                  "wine cupboard",
+                  "wine locker",
+                  "bottle room",
+                  "vino room",
+                  "wine showcase",
+                  "wine display",
+                  "wine rack room",
+                  "wine chamber",
+                  "wine alcove",
+                  "wine nook",
+                  "酒柜",
+                  "酒窖",
+                  "酒储",
+                  "酒室",
+                  "酒橱",
+                  "酒库",
+                  "瓶子房",
+                  "葡萄酒房",
+                  "酒展示",
+                  "酒陈列",
+                  "酒架房",
+                  "酒厢",
+                  "酒角落",
+                  "酒小间",
+                  "酒藏"
+                ],
+                "areaId": "30904611-c0db-4eac-bb7f-1533b6f3cdbc",
+                "canonicalName": "wine cabinet",
+                "floorId": "24b71423-2622-4077-83e3-74382fe3c012",
+                "score": 0.28172273916932533
+              },
+              {
+                "aliases": [
+                  "Cabinet",
+                  "密室"
+                ],
+                "canonicalName": "Cabinet",
+                "score": 0.2771778336803723
+              },
+              {
+                "aliases": [
+                  "Garage",
+                  "车库",
+                  "Carport",
+                  "Workshop",
+                  "Auto Shop",
+                  "Vehicle Bay",
+                  "Parking Space",
+                  "Mechanic's Area",
+                  "Storage Room",
+                  "Tool Shed",
+                  "Driveway",
+                  "Garage Space",
+                  "Garage Area",
+                  "G-Rage",
+                  "Garage Room",
+                  "Car Space",
+                  "Garage Unit",
+                  "车库",
+                  "车房",
+                  "修车间",
+                  "停车位",
+                  "车辆间",
+                  "机械间",
+                  "存储室",
+                  "工具房",
+                  "车道",
+                  "车库空间",
+                  "车库区域",
+                  "车库房",
+                  "车位",
+                  "车库单元",
+                  "车库区"
+                ],
+                "areaId": "94be7177-3a1d-4144-9ef1-f87cccac2e6a",
+                "canonicalName": "Garage",
+                "floorId": "24b71423-2622-4077-83e3-74382fe3c012",
+                "score": 0.27402969158497426
+              },
+              {
+                "aliases": [
+                  "Breakfast Bar",
+                  "早餐吧",
+                  "Morning Buffet",
+                  "Brunch Counter",
+                  "AM Eatery",
+                  "Sunrise Snack Bar",
+                  "Dawn Diner",
+                  "Daybreak Dining",
+                  "Early Bird Café",
+                  "Morning Munch Spot",
+                  "First Light Lounge",
+                  "Sunup Snack Station",
+                  "Breakfast Nook",
+                  "Morning Meal Area",
+                  "AM Bistro",
+                  "Breakfast Counter",
+                  "Morning Bar",
+                  "早餐吧",
+                  "早晨自助餐",
+                  "早午餐柜台",
+                  "晨间小吃吧",
+                  "黎明餐厅",
+                  "晨曦餐饮",
+                  "早鸟咖啡馆",
+                  "晨间小吃点",
+                  "晨光休息室",
+                  "日出小吃站",
+                  "早餐角落",
+                  "晨间用餐区",
+                  "早晨小馆",
+                  "早餐柜台",
+                  "晨间吧台"
+                ],
+                "areaId": "ca82f511-ff38-4a37-953e-06c710f77f1a",
+                "canonicalName": "Breakfast Bar",
+                "floorId": "24b71423-2622-4077-83e3-74382fe3c012",
+                "score": 0.24307018288074578
+              }
+            ],
+            "deviceTypes": [
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "camera",
+                "name": "camera",
+                "score": 1,
+                "toolMapping": [
+                  "get_camera_snapshot",
+                  "list_cameras"
+                ]
+              },
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "uni_switch",
+                "name": "Screen",
+                "score": 0.3359578774557298,
+                "toolMapping": "control_home_uni_switch"
+              },
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "scene",
+                "name": "Create a new scene aaaaaaaaaaaa",
+                "score": 0.29751608007537755,
+                "toolMapping": [
+                  "control_home_scene",
+                  "build_home_scene"
+                ]
+              },
+              {
+                "dbMethods": {
+                  "metadata": "",
+                  "property": null
+                },
+                "deviceType": "light",
+                "name": "spotlight",
+                "score": 0.2724973480755266,
+                "toolMapping": "control_home_light"
+              }
+            ],
+            "floors": [],
+            "tools": []
+          },
+          "suggestedTools": [],
+          "topScore": 0.3359578774557298
+        },
+        "subCommand": "找一下垃圾桶并截图给我",
+        "type": "general"
+      }
+    ],
+    "isCompound": true,
+    "routeType": "ptz",
+    "routingTime": 4773
+  }
+}
+
+现在任务边界不清晰，导致ptz任务容易被识别为compound意图导致路由错误
+我的期望是，只要没有出现“然后”这类词，就认为用户指令应该路由到ptzagent而不是compound，“扫描云台所有预置位帮我找一下垃圾桶并截图给我，通道为1”这句话“通道为1”前都应该路由到ptzagent下再分发ptz相关工具

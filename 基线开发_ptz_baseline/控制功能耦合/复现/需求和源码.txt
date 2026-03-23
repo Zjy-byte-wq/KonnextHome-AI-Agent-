@@ -1,0 +1,543 @@
+下面是基于 agent_async_version.ts 反推出来的开发需求清单（按“可直接用于排期/验收”的方式整理）。
+
+一、核心业务需求
+摄像头预设位控制
+
+支持按预设位编号移动摄像头（如 3~9）。
+移动成功后需等待物理到位时间，再进入下一步流程。
+返回统一结果：成功/失败 + 预设位 + 错误原因。
+摄像头变焦控制
+
+支持传入 level 进行变焦（正值放大，负值缩小）。
+采用“发送变焦指令 + 延时 + 发送停止指令”的双请求机制。
+对请求异常、状态码异常做明确提示。
+画面抓拍与落盘
+
+从摄像头抓取 JPEG 快照并保存到本地 data/。
+文件命名需要时间戳，避免覆盖。
+返回结构化信息：path/url/size_bytes/width/height/ts。
+外网可访问校验
+
+通过 NGROK_URL + 文件名 拼接公网访问地址。
+对该 URL 做可访问性探测，不可访问时返回错误 JSON。
+保障后续图像分析服务能拿到有效图片 URL。
+图像语义分析（目标识别）
+
+支持传入图片 URL 和分析指令（默认场景分析）。
+支持“是否存在某目标（如垃圾桶）”的结构化判断。
+目标识别输出需包含：has_target/confidence/reason/url。
+自动巡检（扫描预设位找目标）
+
+顺序移动多个预设位并抓拍。
+抓拍后立即并行提交图像分析任务（提高整体吞吐）。
+支持配置：presets、target、max_workers。
+最终返回：found/best_preset/details/elapsed_sec。
+二、接口与数据格式需求
+输入参数约定
+
+analyze_image_tool(arg)：arg 必须是 JSON 字符串，含 url，可选 analysis_request。
+find_target_tool(arg)：arg 可为空；不为空时应是 JSON 字符串，支持 presets/target/max_workers。
+move_to_preset_tool(presetId)、camera_zoom(level) 为强类型数值参数。
+输出格式约定
+
+关键工具函数返回 string（其中结构化场景返回 JSON 字符串）。
+错误输出需可被上层统一解析（建议保持 { error: "..." } 风格一致）。
+三、并发与流程控制需求
+并发限制
+
+摄像头“物理动作”必须串行（不能并行移动）。
+图像分析允许并发，且并发上限可配置（max_workers）。
+早停机制
+
+在扫描流程中，一旦检测到目标，应尽快标记命中并输出最优预设位。
+对已提交/已完成任务要有结果回收策略，避免遗漏结果。
+四、稳定性与容错需求
+超时控制
+
+摄像头 HTTP 请求需设置超时（如 8s）。
+公网 URL 可访问性探测需短超时（如 5s）。
+异常兜底
+
+网络异常、JSON 解析异常、图像尺寸识别异常都不能导致进程崩溃。
+所有异常应返回业务可读信息，便于排障。
+默认配置回退
+
+支持环境变量读取并提供默认值（CAM_IP/CAM_USER/CAM_PASS/NGROK_URL/OPENAI_API_KEY）。
+在缺省配置下也应能启动流程（除外部服务不可达场景）。
+五、工程化需求
+TypeScript 无报错构建
+
+项目需提供 tsconfig.json 和 npm scripts，支持 npm run build。
+代码需在严格类型检查下可通过编译。
+可运行入口
+
+提供 main() 作为本地调试入口，输出执行结果与耗时。
+失败时以非 0 退出码结束，便于 CI/CD 识别。
+
+
+import fs from "node:fs/promises";
+import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { imageSize } from "image-size";
+import OpenAI from "openai";
+import DigestFetch from "digest-fetch";
+
+type CaptureFrameResult = {
+  path: string;
+  url: string;
+  size_bytes: number;
+  width: number | null;
+  height: number | null;
+  ts: string;
+};
+
+type AnalyzeImageResult = {
+  has_target: boolean;
+  confidence: number;
+  reason: string;
+  url: string;
+};
+
+type FindTargetResult = {
+  found: boolean;
+  best_preset: number | null;
+  details: Array<Record<string, unknown>>;
+  elapsed_sec: number;
+};
+
+type FindTargetConfig = {
+  presets?: number[];
+  target?: string;
+  max_workers?: number;
+};
+
+const openaiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY ?? "",
+});
+
+function nowTimestamp(): string {
+  const d = new Date();
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return [
+    d.getFullYear(),
+    pad(d.getMonth() + 1),
+    pad(d.getDate()),
+    "-",
+    pad(d.getHours()),
+    pad(d.getMinutes()),
+    pad(d.getSeconds()),
+  ].join("");
+}
+
+function getCameraAuthClient(): DigestFetch {
+  const camUser = process.env.CAM_USER ?? "admin";
+  const camPass = process.env.CAM_PASS ?? "Admin.123";
+  return new DigestFetch(camUser, camPass);
+}
+
+function getCameraIp(): string {
+  return process.env.CAM_IP ?? "172.16.10.202";
+}
+
+async function requestWithTimeout(
+  req: () => Promise<Response>,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await req();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+async function _impl_move_to_preset(presetId: number): Promise<string> {
+  const camIp = getCameraIp();
+  const url = `http://${camIp}/ISAPI/PTZCtrl/channels/1/presets/${presetId}/goto`;
+  const digestClient = getCameraAuthClient();
+
+  try {
+    const resp = await requestWithTimeout(
+      () => digestClient.fetch(url, { method: "PUT" }) as Promise<Response>,
+      8000,
+    );
+    if (resp.status === 200) {
+      await sleep(3000);
+      return `OK preset=${presetId}`;
+    }
+    return `ERR preset=${presetId} status=${resp.status}`;
+  } catch (error) {
+    return `ERR preset=${presetId} ex=${normalizeError(error)}`;
+  }
+}
+
+async function _impl_capture_frame(): Promise<Record<string, unknown>> {
+  try {
+    const raw = await capture_frame_tool();
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    return { error: `capture parse error: ${normalizeError(error)}` };
+  }
+}
+
+async function _impl_analyze_image_json(
+  url: string,
+  target = "垃圾桶",
+): Promise<AnalyzeImageResult> {
+  const promptText =
+    `请判断图片中是否存在${target}。只输出 JSON，不要多余文本：` +
+    '{"has_target": <true|false>, "confidence": <0到1>, "reason": "<中文简要理由>"}';
+
+  const resp = await openaiClient.chat.completions.create({
+    model: "gpt-4o",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url } },
+          { type: "text", text: promptText },
+        ],
+      },
+    ],
+    max_tokens: 200,
+  });
+
+  const content = resp.choices[0]?.message?.content ?? "";
+  try {
+    const obj = JSON.parse(content) as Partial<AnalyzeImageResult>;
+    if (typeof obj !== "object" || obj === null) {
+      throw new Error("not object");
+    }
+    return {
+      has_target: Boolean(obj.has_target),
+      confidence:
+        typeof obj.confidence === "number" ? obj.confidence : Number(obj.confidence ?? 0.5),
+      reason: String(obj.reason ?? ""),
+      url,
+    };
+  } catch {
+    const lower = content.toLowerCase();
+    return {
+      has_target: content.includes("有") || content.includes("存在") || lower.includes("yes"),
+      confidence: 0.5,
+      reason: content.slice(0, 200),
+      url,
+    };
+  }
+}
+
+export async function capture_frame_tool(): Promise<string> {
+  const ts = nowTimestamp();
+  const dataDir = path.resolve("data");
+  await fs.mkdir(dataDir, { recursive: true });
+  const savePath = path.join(dataDir, `snap_${ts}.jpg`);
+
+  const camIp = getCameraIp();
+  const url = `http://${camIp}/ISAPI/Streaming/channels/101/picture`;
+  const digestClient = getCameraAuthClient();
+
+  const resp = await requestWithTimeout(
+    () => digestClient.fetch(url, { method: "GET" }) as Promise<Response>,
+    8000,
+  );
+  if (!resp.ok) {
+    throw new Error(`capture failed, status=${resp.status}`);
+  }
+
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  await fs.writeFile(savePath, buffer);
+
+  const sizeBytes = buffer.byteLength;
+  let width: number | null = null;
+  let height: number | null = null;
+  try {
+    const dimensions = imageSize(buffer);
+    width = dimensions.width ?? null;
+    height = dimensions.height ?? null;
+  } catch {
+    width = null;
+    height = null;
+  }
+
+  const ngrokUrl = process.env.NGROK_URL ?? "https://0c07c83a1117.ngrok-free.app";
+  const httpUrl = `${ngrokUrl}/${path.basename(savePath)}`;
+
+  try {
+    const testResp = await requestWithTimeout(() => fetch(httpUrl), 5000);
+    if (!testResp.ok) {
+      throw new Error(`status=${testResp.status}`);
+    }
+  } catch (error) {
+    return JSON.stringify({ error: `URL 无法访问: ${normalizeError(error)}` });
+  }
+
+  const result: CaptureFrameResult = {
+    path: savePath,
+    url: httpUrl,
+    size_bytes: sizeBytes,
+    width,
+    height,
+    ts,
+  };
+  return JSON.stringify(result);
+}
+
+export async function camera_zoom(level: number): Promise<string> {
+  const camIp = getCameraIp();
+  const url = `http://${camIp}/ISAPI/PTZCtrl/channels/1/continuous`;
+  const digestClient = getCameraAuthClient();
+  const headers = { "Content-Type": "application/xml" };
+  const data =
+    `<?xml version="1.0" encoding="utf-8"?>\n` +
+    `<PTZData version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n` +
+    `  <zoom>${level}</zoom>\n` +
+    `</PTZData>`;
+
+  const dataStop =
+    `<?xml version="1.0" encoding="utf-8"?>\n` +
+    `<PTZData version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n` +
+    `  <zoom>0</zoom>\n` +
+    `</PTZData>`;
+
+  try {
+    const resp1 = await requestWithTimeout(
+      () =>
+        digestClient.fetch(url, {
+          method: "PUT",
+          headers,
+          body: data,
+        }) as Promise<Response>,
+      8000,
+    );
+    await sleep(500);
+    const resp2 = await requestWithTimeout(
+      () =>
+        digestClient.fetch(url, {
+          method: "PUT",
+          headers,
+          body: dataStop,
+        }) as Promise<Response>,
+      8000,
+    );
+    if (resp1.status === 200 && resp2.status === 200) {
+      return `摄像头变焦指令已发送，level=${level}`;
+    }
+    return `变焦失败，状态码: ${resp1.status}/${resp2.status}`;
+  } catch (error) {
+    return `变焦请求异常: ${normalizeError(error)}`;
+  }
+}
+
+export async function analyze_image_tool(arg: string): Promise<string> {
+  let url = "";
+  let analysisRequest = "请分析图片中的场景";
+  try {
+    const data = JSON.parse(arg) as { url: string; analysis_request?: string };
+    url = data.url;
+    analysisRequest = data.analysis_request ?? analysisRequest;
+  } catch (error) {
+    return `参数解析失败: ${normalizeError(error)}`;
+  }
+
+  if (!url.startsWith("http")) {
+    return "Invalid URL format.";
+  }
+
+  const response = await openaiClient.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url } },
+          { type: "text", text: analysisRequest },
+        ],
+      },
+    ],
+    max_tokens: 512,
+  });
+
+  return response.choices[0]?.message?.content ?? "";
+}
+
+export async function move_to_preset_tool(presetId: number): Promise<string> {
+  const camIp = getCameraIp();
+  const url = `http://${camIp}/ISAPI/PTZCtrl/channels/1/presets/${presetId}/goto`;
+  const digestClient = getCameraAuthClient();
+
+  try {
+    const resp = await requestWithTimeout(
+      () => digestClient.fetch(url, { method: "PUT" }) as Promise<Response>,
+      8000,
+    );
+    if (resp.status === 200) {
+      await sleep(2000);
+      return `摄像头已移动到预设位置 ${presetId}。`;
+    }
+    return `移动失败，状态码: ${resp.status}`;
+  } catch (error) {
+    return `移动请求异常: ${normalizeError(error)}`;
+  }
+}
+
+type PendingAnalyze = {
+  preset: number;
+  url: string;
+  done: boolean;
+  result?: AnalyzeImageResult;
+  error?: string;
+};
+
+async function runWithConcurrency<T>(
+  workers: number,
+  tasks: Array<() => Promise<T>>,
+): Promise<T[]> {
+  const results: T[] = [];
+  let idx = 0;
+
+  async function worker(): Promise<void> {
+    while (idx < tasks.length) {
+      const current = idx++;
+      const out = await tasks[current]();
+      results[current] = out;
+    }
+  }
+
+  const count = Math.max(1, workers);
+  await Promise.all(Array.from({ length: count }, () => worker()));
+  return results;
+}
+
+export async function find_target_tool(arg = ""): Promise<string> {
+  let cfg: FindTargetConfig = {};
+  try {
+    cfg = arg ? (JSON.parse(arg) as FindTargetConfig) : {};
+  } catch (error) {
+    return JSON.stringify({ error: `参数解析失败: ${normalizeError(error)}` });
+  }
+
+  const presets = cfg.presets && cfg.presets.length > 0 ? cfg.presets : [3, 4, 5, 6, 7, 8, 9];
+  const target = cfg.target ?? "垃圾桶";
+  const maxWorkers = Number(cfg.max_workers ?? 3);
+
+  const t0 = Date.now();
+  const details: Array<Record<string, unknown>> = [];
+  let found = false;
+  let bestPreset: number | null = null;
+  const pendingList: PendingAnalyze[] = [];
+
+  const collectDone = (): void => {
+    for (const item of pendingList) {
+      if (!item.done || (item.done && item.result === undefined && item.error === undefined)) {
+        continue;
+      }
+
+      if ((item as PendingAnalyze & { harvested?: boolean }).harvested) {
+        continue;
+      }
+
+      if (item.error) {
+        details.push({ preset: item.preset, url: item.url, error: item.error });
+      } else if (item.result) {
+        const entry = {
+          preset: item.preset,
+          url: item.url,
+          has_target: Boolean(item.result.has_target),
+          confidence: Number(item.result.confidence ?? 0),
+          reason: item.result.reason ?? "",
+        };
+        details.push(entry);
+        if (entry.has_target && !found) {
+          found = true;
+          bestPreset = item.preset;
+        }
+      }
+
+      (item as PendingAnalyze & { harvested?: boolean }).harvested = true;
+    }
+  };
+
+  const tasks: Array<() => Promise<void>> = [];
+
+  for (const pid of presets) {
+    if (found) {
+      break;
+    }
+
+    const mv = await _impl_move_to_preset(pid);
+    if (!mv.startsWith("OK")) {
+      details.push({ preset: pid, error: mv });
+      continue;
+    }
+
+    const shot = await _impl_capture_frame();
+    if ("error" in shot || !shot.url) {
+      details.push({ preset: pid, error: shot.error ?? "capture failed" });
+      continue;
+    }
+
+    const url = String(shot.url);
+    const pending: PendingAnalyze = { preset: pid, url, done: false };
+    pendingList.push(pending);
+    tasks.push(async () => {
+      try {
+        pending.result = await _impl_analyze_image_json(url, target);
+      } catch (error) {
+        pending.error = `analyze ex=${normalizeError(error)}`;
+      } finally {
+        pending.done = true;
+      }
+    });
+
+    collectDone();
+    if (found) {
+      break;
+    }
+  }
+
+  if (tasks.length > 0) {
+    await runWithConcurrency(maxWorkers, tasks);
+    collectDone();
+  }
+
+  const elapsed = Number(((Date.now() - t0) / 1000).toFixed(3));
+  const out: FindTargetResult = {
+    found,
+    best_preset: bestPreset,
+    details,
+    elapsed_sec: elapsed,
+  };
+  return JSON.stringify(out);
+}
+
+async function main(): Promise<void> {
+  const userInput = "帮我看看外面有没有垃圾桶，当前画面没找到的话可以调用find_target_tool";
+  const start = Date.now();
+
+  const result = await find_target_tool(
+    JSON.stringify({
+      presets: [3, 4, 5, 6, 7, 8, 9],
+      target: "垃圾桶",
+      max_workers: 3,
+    }),
+  );
+
+  console.log({ input: userInput, result });
+  console.log(`运行时间: ${((Date.now() - start) / 1000).toFixed(2)} 秒`);
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("程序执行失败:", error);
+    process.exit(1);
+  });
+}

@@ -1,0 +1,11 @@
+把云台摄像头移动到7号预置位并给我画面
+move to preset --> capture frame 串行
+
+缩放当前云台画面并给我截图
+zoom --> capture frame串行
+
+把云台移动到5号预置位缩放5倍后给我画面截图
+move to preset -->zoom -->capture frame 串行
+
+扫描云台所有预置位分析是否有汽车存在，如果有的话给我汽车画面截图
+find target tool --> capture frame 串行

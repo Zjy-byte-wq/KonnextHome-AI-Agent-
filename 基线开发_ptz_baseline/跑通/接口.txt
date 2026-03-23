@@ -1,0 +1,4 @@
+用来确认这个通道到底支持哪些能力（是否支持 presets、zoom、focus 等），避免你一上来就调用不支持的能力导致“看起来链路坏了”
+GET /ISAPI/PTZCtrl/channels/<ID>/capabilities
+用来做“PTZ 当前状态查询”基线（也是排错神器：能看到设备是否在线、当前倍率/焦距/云台状态等）。
+GET /ISAPI/PTZCtrl/channels/<ID>/status

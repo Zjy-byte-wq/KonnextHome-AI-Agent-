@@ -1,0 +1,113 @@
+以下为**仅评价、不修改**的 code review 结果，按严重度排序。若无改动需求，我不会触碰代码。
+
+**高风险**
+1. **RAG 路由无法稳定命中 PTZ（仅靠显式关键字）**  
+`src/chatbot/knowledge_base/knowledge.service.ts`  
+当前 `AgentType` 只基于 control/vision 双 KB 计算，`ptz` 不在 DualKB 逻辑里，只有 `hasPtzWord` 的显式规则才会路由到 `ptz`。这意味着“PTZ 状态/能力”类请求如果没有命中关键词（或被同义词替换/非中文表述），可能仍被路由到 `home_control/vision/general`，工具门控也可能不给 PTZ 工具。  
+风险：PTZ 场景召回不稳定。
+
+**中风险**
+1. **Digest 认证实现较“最小”，兼容性不完整**  
+`src/http-client/ptz-http-client.service.ts`  
+当前只支持 `MD5`，未处理 `MD5-sess` / `stale=true` / `qop` 多值 / `auth-int` 等情况；若设备返回不同 Digest 参数，可能无法鉴权。  
+风险：部分机型或固件版本调用失败。
+
+2. **PTZ 消息上下文未独立存储**  
+`src/chatbot/langgraph/state.ts`, `src/chatbot/langgraph/muti-agent-graph.ts`  
+PTZ agent 的 `ptzMessages` 没接入（你为避免编码问题移除了），因此 PTZ 对话不会像 Vision/HomeControl 一样保留独立上下文。  
+风险：多轮 PTZ 对话的上下文记忆弱。
+
+3. **工具执行时 XML 解析不足**  
+`src/http-client/ptz-http-client.service.ts`  
+PTZ ISAPI 常返回 XML。当前返回 JSON 包装里 `data` 可能是原始 XML 字符串。对“相似写法”的要求已满足，但若后续 LLM 需要提取字段，解析难度较高。  
+风险：下游解析成本较高。
+
+**低风险**
+1. **默认凭据写死在配置**  
+`src/config/app.config.ts`  
+PTZ 的默认 `url/username/password` 写入了真实值。  
+风险：配置泄漏或误部署到其他环境。
+
+2. **编码/乱码迹象**  
+`src/chatbot/knowledge_base/knowledge.service.ts`, `src/chatbot/knowledge_base/tools_v2.json`  
+从内容检索结果看，部分中文已出现 mojibake（如 `äº‘å°`）。这可能是文件编码混乱导致。  
+风险：日志/提示词可读性下降，规则匹配可能失效。
+
+3. **RAG 工具库统计字段手改**  
+`src/chatbot/knowledge_base/tools_v2.json`  
+`statistics.total_tools` 手动修改，易与实际工具数量不一致。  
+风险：仅限统计错误，不影响功能。
+
+**测试/验证缺口**
+1. 未验证 Digest 认证是否与设备固件兼容（401 → Digest 重试 → 200）。  
+2. 未验证 PTZ 路由：  
+- “查询云台状态” → ptzAgent  
+- “摄像头状态”是否会误路由  
+3. 未验证 RAG seed 对新增工具的影响（`seedStaticTools` 需重新执行）。
+
+如果你需要，我可以在不改动代码的前提下给出**最小验证清单**或**手工调用步骤**。
+
+**人工检查清单（含文件名）**
+
+1. `src/http-client/ptz-http-client.service.ts`  
+- Digest 认证是否按设备要求（401 → 解析 `WWW-Authenticate` → 重试）  
+- `baseUrl` 是否为 `http://172.16.10.202:8000`  
+- 错误返回是否统一 `{success:false, code, message, action:"query"}`  
+- XML 响应是否按预期透传到 `data`
+
+2. `src/http-client/http-client.module.ts`  
+- 是否注册并导出 `PtzHttpClientService`
+
+3. `src/chatbot/tools/ptz-camera.tool.provider.ts`  
+- 工具名是否严格为 `ptz_get_capabilities` / `ptz_get_status`  
+- 参数名是否为 `channelId`  
+- 返回是否 `JSON.stringify(result)` 且 result 字段与 camera 类似
+
+4. `src/chatbot/tools/tool.module.ts`  
+- `PtzCameraToolProvider` 是否在 `providers` 和 `exports`
+
+5. `src/chatbot/context-builder/ptz-context.builder.ts`  
+- System prompt 是否只描述 PTZ 能力/状态  
+- 未混入 snapshot 相关行为  
+- 未要求使用 camera 工具
+
+6. `src/chatbot/context-builder/context-builder.interface.ts`  
+- `RouteType`/`IntentType` 是否包含 `ptz`  
+- `mapIntentToRouteType` 是否识别 `ptz`
+
+7. `src/chatbot/context-builder/router-context.builder.ts`  
+- `intentDetectionSchema` 是否包含 `ptz`  
+- Prompt 规则是否明确 PTZ 状态/能力 → `ptz`
+
+8. `src/chatbot/context-builder/context-builder.factory.ts`  
+- `builders` Map 是否注册 `ptz`
+
+9. `src/chatbot/context-builder/context-builder.module.ts`  
+- `PtzContextBuilder` 是否在 `providers`/`exports`
+
+10. `src/chatbot/langgraph/muti-agent-graph.ts`  
+- 是否新增 `ptzAgent` 节点  
+- 是否新增 `ptzGetCapabilities` / `ptzGetStatus` 节点与 edges  
+- `getAgentNodeName` 是否包含 `ptz`  
+- `executeToolCalls` / `executeSingleToolCall` 是否支持 `ptz_` 前缀  
+- `QUERY_TOOLS` 是否包含 `ptz_get_*`
+
+11. `src/chatbot/constants/device-mappings.ts`  
+- 是否新增 `ptz_camera` mapping  
+- `tools` / `nodeNames` 是否对应 `ptz_get_*` / `ptzGet*`  
+- 关键词/explicit/intent 是否合理
+
+12. `src/chatbot/knowledge_base/tools_v2.json`  
+- 是否新增 `ptz_get_capabilities` / `ptz_get_status`  
+- `embedding_text` / `example_queries` 是否覆盖“云台状态/能力”  
+- `total_tools` 是否与实际数量一致
+
+13. `src/chatbot/knowledge_base/knowledge.service.ts`  
+- `AgentType` 是否包含 `ptz`  
+- 显式 PTZ 关键字路由是否生效  
+- `hasDeviceInCommand` 是否包含 `ptz/云台`
+
+14. `src/chatbot/chatbot.service.ts`  
+- `MultiAgentGraph` 构造是否注入 `PtzCameraToolProvider`  
+
+如果需要，我可以把清单转成可打勾的模板或补一份“验收用例清单”。

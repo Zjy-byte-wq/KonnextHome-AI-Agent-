@@ -1,0 +1,3 @@
+需求：在langsmith中显示得到的真实图片
+
+调用httpClientService.uploadBase64SnapshotToCloud上传云端接口

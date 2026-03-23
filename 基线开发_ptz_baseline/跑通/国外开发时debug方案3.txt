@@ -1,0 +1,46 @@
+现存的问题是：如果用户询问“你好kon，我想知道当前云台有什么功能，状态如何，通道是1”，其中“状态如何”会被识别为general类型而不是ptz类型（没有被识别为ptz的参数补充句），
+
+导致llm回答：已成功获取云台的功能信息。该云台支持绝对和连续的平移、倾斜和缩放操作，最多可设置300个预置位，支持8个巡航路径和4个模式路径。此外，还支持一键巡航和一键停靠功能。若有其他问题，请随时告诉我！我很好，谢谢！有什么我可以帮您的吗？-->对 ”状态如何“的回答
+
+根因分析：
+src/chatbot/context-builder/context-builder.factory.ts
+只把其他参数句并入ptz中，没有把“状态”并入ptz中
+
+解决方案：
+改 context-builder.factory.ts 的“并回 PTZ”逻辑，增加 ptzSupplementPattern，把 general 里的“状态/功能/能力/支持/变焦/角度”等补充句也并入 PTZ但又不会把普通句也并入ptz中。-->提高意图识别率，改后如下：
+
+const channelPattern =
+  /(通道\s*(id|号)?\s*(为|是|=|:)?\s*\d+|\d+\s*号?\s*通道|channel\s*(id)?\s*(is|=|:)?\s*\d+)/i;
+
+// 新增：PTZ语义补充句（即使没出现“云台/ptz”字样）
+const ptzSupplementPattern =
+  /(状态|功能|能力|支持|仰角|方位角|俯仰|水平角|垂直角|变焦|zoom|pan|tilt|capabilit(y|ies)|status)/i;
+
+// 可选：避免把纯寒暄并入PTZ
+const smalltalkPattern = /(你好|hello|hi|在吗|谢谢|thank)/i;
+
+const ptzIdx = intents.findIndex((i) => i.type === "ptz");
+if (ptzIdx >= 0) {
+  for (let i = intents.length - 1; i >= 0; i--) {
+    if (i === ptzIdx) continue;
+    const isGeneral = intents[i].type === "general";
+    const sub = intents[i].subCommand || "";
+
+    const shouldMergeToPtz =
+      isGeneral &&
+      !smalltalkPattern.test(sub) &&
+      (channelPattern.test(sub) || ptzSupplementPattern.test(sub));
+
+    if (shouldMergeToPtz) {
+      intents[ptzIdx].subCommand =
+        `${intents[ptzIdx].subCommand || ""} ${sub}`.trim();
+      intents.splice(i, 1);
+    }
+  }
+}
+
+预期结果：
+“状态如何”不再作为独立 general 句，而是作为 PTZ 补充语义并回 PTZ。
+PTZ 子命令会同时包含“功能 + 状态 + 通道”，模型更稳定地同时触发 ptz_get_capabilities 和 ptz_get_status。
+general 噪声（“我很好，谢谢…”）会明显减少。
+

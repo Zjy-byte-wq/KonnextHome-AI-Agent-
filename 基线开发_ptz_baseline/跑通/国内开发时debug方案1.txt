@@ -1,0 +1,465 @@
+2026/2/24运行日志1：
+konnextadmin@konnextadmin:/opt/ai$ pm2 logs --lines 1000 | grep -i "ptz" 
+1|konnext- | [2026-02-24 14:38:07.921 +1100] 
+INFO: [DualKBRoute] "查看ptz信息..." | Control: no(0.00) | Vision: no(0.00) | Compound: false | Agent: ptz | Time: 5418ms 1|konnext- | [2026-02-24 14:38:07.935 +1100] 
+DEBUG: [IntentService] Multi-intent detected: ptz_camera(0.90) vs camera(0.70), dominance=0.20 1|konnext- | [2026-02-24 14:38:07.936 +1100] 
+INFO: [IntentService] LLM parsing required: multi_intent_no_conjunction for query "查看ptz信息..." 1|konnext- | [2026-02-24 14:38:08.457 +1100] 
+INFO: [Route] "查看ptz信息..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=5957ms 1|konnext- | [2026-02-24 14:38:08.457 +1100] 
+INFO: [Router] Starting LLM route for command: "查看ptz信息" 1|konnext- | [2026-02-24 14:39:08.546 +1100] 
+INFO: [Router] Fallback: using RAG agentType=ptz, confidence=low 1|konnext- | [2026-02-24 14:39:08.546 +1100] 
+INFO: [Factory] Router LLM fallback: routeType=ptz, isCompound=false, time=66048ms 1|konnext- | [2026-02-24 14:39:08.546 +1100] 
+INFO: [Router] Completed in 66048ms: routeType=ptz, isCompound=false, intents=[ptz] 
+
+且langsmith监控中报错error
+Request was aborted. 
+AbortError: Request was aborted.
+    at wrapOpenAIClientError (/opt/ai/node_modules/openai.cjs:18:17)
+    at /opt/ai/node_modules/chat_models.cjs:1582:69
+    at RetryOperation._fn (/opt/ai/node_modules/p-retry/index.js:50:12)
+
+问题分析：
+请求“查看ptz信息”已经被 RAG 判到 agent=ptz，但因为 score=0.00 被判成 confidence=low，系统继续走 Router LLM；Router LLM 请求超过 60 秒被中断，LangSmith 报 AbortError，于是整体体验变成“卡 60 秒再 fallback”。核心问题是：ptz 这类明确意图没有被“快速直达”，反而被送去慢路径 LLM。
+日志链路解释（对应你贴的日志）
+
+[DualKBRoute] ... Agent: ptz | Time: 5418ms
+RAG 规则里已经把它判为 ptz，但这里的分数还是 0。
+[Route] ... confidence=low, score=0.00
+confidence 低 → 触发 Router LLM 兜底。
+[Router] Starting LLM route ...
+进入 LLM Structured Output 路由。
+60 秒后 Fallback: using RAG agentType=ptz
+LLM 侧请求超时或被 abort，LangSmith 报 AbortError。
+为什么会“明明识别了 ptz 还要走 LLM”
+目前路由逻辑是：
+
+RAG confidence != low 才直接走路由。
+你这个 query 的 topScore=0.00 → confidence=low → 必走 LLM。
+LLM 超时后才回退到 RAG ptz。
+所以“ptz 明确意图”被错误地拖到慢路径。
+
+重点改动：
+/opt/ai/src/chatbot/knowledge_base/tools_v2.json
+# 改动内容
+{
+  "tools": [
+    {
+      "type": "tool",
+      "tool_name": "control_home_light",
+      "description": "Control home lights by ID. Turn on/off, adjust brightness (1-100), or color temperature (2700-6500K). Supports relative values like '+20' or '-300'.",
+      "description_en": "Call this function to control home lights by ID. You can turn them on or off, adjust brightness (1~100), or color temperature (2700~6500). If user gives relative values like '+20' or '-300', apply it based on current state and clamp into valid range.",
+      "applicable_device_types": ["light"],
+      "parameters": {
+        "id": {
+          "type": "array",
+          "items": {"type": "string"},
+          "required": true,
+          "description": "The id of the light(s) to control"
+        },
+        "on": {
+          "type": "boolean",
+          "nullable": true,
+          "description": "Turn the light on or off"
+        },
+        "brightness": {
+          "type": "string",
+          "nullable": true,
+          "description": "The brightness of the light (1-100, or relative like '+10'/'-10')"
+        },
+        "colorTemp": {
+          "type": "string",
+          "nullable": true,
+          "description": "The color temperature (2700-6500K, or relative like '+300'/'-300')"
+        }
+      },
+      "embedding_text": "control_home_light: Control lights, turn on/off, adjust brightness 1-100, color temperature 2700-6500K, supports relative values. Use for: turn on light, turn off light, brighter, dimmer, warmer, cooler, set brightness to 50%, set color temperature",
+      "example_queries": ["turn on the light", "turn off living room lights", "make it brighter", "dim the lights", "warmer light", "cooler light", "set brightness to 50%"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_curtain",
+      "description": "Control curtains by ID. Open, close, or set specific percentage (0=closed, 100=open).",
+      "description_en": "Call this function to control a list of home curtains by their ID field. The user can open or close the curtain, or specify a specific percentage which represents the extent to which curtain is open. This percentage is between 0 and 100, where 0 means completely closed and 100 means completely open.",
+      "applicable_device_types": ["curtain"],
+      "parameters": {
+        "id": {
+          "type": "array",
+          "items": {"type": "string"},
+          "required": true,
+          "description": "The id of the curtain(s) to control"
+        },
+        "open": {
+          "type": "boolean",
+          "nullable": true,
+          "description": "Open (true) or close (false) the curtain"
+        },
+        "percentage": {
+          "type": "number",
+          "nullable": true,
+          "description": "Target position 0-100 (0=fully closed, 100=fully open)"
+        }
+      },
+      "embedding_text": "control_home_curtain: Control curtains, open, close, set percentage position 0-100. Use for: open curtain, close curtain, open halfway, set to 30%",
+      "example_queries": ["open the curtains", "close the curtains", "open curtains halfway", "set curtain to 30%"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_aircon_station",
+      "description": "Control air conditioning by station ID. Turn on/off, set mode (COOL/HEAT/DRY/AIR/AUTO), fan speed (LOW/MEDIUM/HIGH/POWERFUL/AUTO), and temperature.",
+      "description_en": "Call this function to control home air conditioning by its ID field. This tool MUST be called exactly once per area. When turning OFF, only send {id, area, on:false}. Supports mode, fan speed, and temperature control.",
+      "applicable_device_types": ["aircon_station"],
+      "parameters": {
+        "id": {
+          "type": "string",
+          "required": true,
+          "description": "Aircon station ID"
+        },
+        "area": {
+          "type": "string",
+          "required": true,
+          "description": "Exactly ONE area name (e.g., 'Living room')"
+        },
+        "on": {
+          "type": "boolean",
+          "required": true,
+          "description": "Turn the aircon on/off"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["COOL", "HEAT", "DRY", "AIR", "AUTO"],
+          "description": "Operating mode"
+        },
+        "speed": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH", "POWERFUL", "AUTO"],
+          "description": "Fan speed (check device support before using AUTO)"
+        },
+        "setTemp": {
+          "type": "string",
+          "description": "Temperature: absolute '23' or relative '+2'/'-1'"
+        }
+      },
+      "important_notes": [
+        "Must be called once per area, not multiple areas at once",
+        "When turning OFF, only send id, area, and on=false",
+        "Check device support for AUTO fan speed",
+        "Temperature supports relative values like +2 or -1"
+      ],
+      "embedding_text": "control_home_aircon_station: Control air conditioning, turn on/off, set mode COOL/HEAT/DRY/AIR/AUTO, fan speed LOW/MEDIUM/HIGH/POWERFUL/AUTO, temperature 18-30°C. Use for: turn on AC, turn off air conditioner, set to cooling mode, heating mode, adjust temperature, change fan speed, it's too hot, it's too cold",
+      "example_queries": ["turn on the AC", "turn off air conditioner", "set AC to cooling", "heating mode", "raise temperature", "lower the temperature", "it's too hot", "it's too cold", "set to 24 degrees"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_uni_switch",
+      "description": "Control universal switches (fans, heaters, appliances) by ID. Only supports on/off.",
+      "description_en": "Call this function to control home uni switches by their ID field. The control can be turning on/off the uni switches. Uni Switches only support turning on or off.",
+      "applicable_device_types": ["uni_switch"],
+      "parameters": {
+        "id": {
+          "type": "string",
+          "required": true,
+          "description": "The id of the uni switch"
+        },
+        "name": {
+          "type": "string",
+          "required": true,
+          "description": "The name of the uni switch"
+        },
+        "on": {
+          "type": "boolean",
+          "required": true,
+          "description": "Turn the switch on or off"
+        },
+        "area": {
+          "type": "string",
+          "required": true,
+          "description": "The area where the switch is located"
+        }
+      },
+      "embedding_text": "control_home_uni_switch: Control universal switches like fans, heaters, stoves, towel rails. Only on/off control. Use for: turn on fan, turn off stove, turn on heated towel rail",
+      "example_queries": ["turn on the fan", "turn off the stove", "turn on heated towel rail", "turn off electric fan"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_floor_heating",
+      "description": "Control floor heating by device ID or area name. Turn on/off and set temperature (10-35°C). Supports relative temperature values.",
+      "description_en": "Control floor heating by device ID(s) or by area name. If an area has multiple devices, control ALL of them. You can turn on/off and set temperature (absolute '22' or relative '+2'/'-1'). Typical range 10–35°C.",
+      "applicable_device_types": ["floor_heating"],
+      "parameters": {
+        "id": {
+          "type": ["string", "array", "null"],
+          "description": "Device ID or array of IDs (optional if areaName provided)"
+        },
+        "areaName": {
+          "type": ["string", "array", "null"],
+          "description": "Area name(s), e.g. 'Living Room'"
+        },
+        "on": {
+          "type": "boolean",
+          "nullable": true,
+          "description": "Turn on/off (defaults to true if omitted)"
+        },
+        "setTemp": {
+          "type": "string",
+          "nullable": true,
+          "description": "Temperature: absolute '22' or relative '+2'/'-1'"
+        }
+      },
+      "embedding_text": "control_home_floor_heating: Control floor heating, turn on/off, set temperature 10-35°C. Use for: turn on floor heating, turn off floor heating, set floor heating to 25 degrees, raise floor heating temperature",
+      "example_queries": ["turn on floor heating", "turn off floor heating", "set floor heating to 25 degrees", "floor heating warmer"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_simple_floor_heating",
+      "description": "Time-cycled floor heating control. Set ON minutes and OFF minutes for cycling. Use when user mentions minutes/timer/cycle.",
+      "description_en": "Time-cycled floor heating. Use when user mentions minutes/timer/cycle (e.g., '10分钟', '开30关15'). startTime = ON minutes, stopTime = OFF minutes. on=true starts cycling; on=false stops.",
+      "applicable_device_types": ["floor_heating"],
+      "parameters": {
+        "id": {
+          "type": "string",
+          "nullable": true,
+          "description": "Device ID (optional if areaName provided)"
+        },
+        "areaName": {
+          "type": "string",
+          "nullable": true,
+          "description": "Area name"
+        },
+        "on": {
+          "type": "boolean",
+          "nullable": true,
+          "description": "true=start cycling, false=stop"
+        },
+        "startTime": {
+          "type": "integer",
+          "range": "1-1440",
+          "description": "Minutes ON per cycle"
+        },
+        "stopTime": {
+          "type": "integer",
+          "range": "1-1440",
+          "description": "Minutes OFF per cycle"
+        }
+      },
+      "embedding_text": "control_home_simple_floor_heating: Floor heating timer/cycle control. Set on minutes and off minutes for cycling. Use for: floor heating on 10 minutes off 15 minutes, timer mode, cycle heating",
+      "example_queries": ["floor heating on 10 minutes off 15 minutes", "set floor heating timer", "cycle the floor heating"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "control_home_scene",
+      "description": "Activate an existing home automation scene by ID and name.",
+      "description_en": "Activate an existing home automation scene by name. Use when users mention scene names or modes (e.g., 'Movie Night', 'Sleep Mode'). This tool does NOT create scenes.",
+      "applicable_device_types": ["scene"],
+      "parameters": {
+        "id": {
+          "type": "string",
+          "required": true,
+          "description": "Scene ID to activate"
+        },
+        "name": {
+          "type": "string",
+          "required": true,
+          "description": "Scene name (e.g., 'Movie Night', 'Sleep Mode')"
+        }
+      },
+      "embedding_text": "control_home_scene: Activate/trigger existing scene. Use for: activate movie mode, turn on sleep scene, start home scene, trigger away mode, good night mode, movie night",
+      "example_queries": ["activate movie mode", "turn on sleep scene", "good night", "movie night", "activate away mode"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "build_home_scene",
+      "description": "Create a new scene from the current snapshot of devices in a specified area.",
+      "description_en": "Build a new scene from the CURRENT SNAPSHOT of the specified area. Call immediately when the user provides scene name + area; do NOT ask follow-ups.",
+      "applicable_device_types": ["scene"],
+      "parameters": {
+        "name": {
+          "type": "string",
+          "required": true,
+          "description": "Scene name reflecting its purpose (e.g., 'Morning Routine')"
+        },
+        "description": {
+          "type": "string",
+          "nullable": true,
+          "description": "Optional description (auto-generated if missing)"
+        },
+        "area": {
+          "type": "string",
+          "required": true,
+          "description": "Area name where scene is created (e.g., 'Living Room')"
+        }
+      },
+      "embedding_text": "build_home_scene: Create new scene from current device states. Use for: create a scene, save current settings as scene, make a new movie scene, build reading mode",
+      "example_queries": ["create a movie scene", "save current settings as reading mode", "build a new scene called party mode"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "music_play",
+      "description": "Search and play music on available music players. Specify search query and area(s).",
+      "description_en": "Play music by searching and playing on available music players. Extract all areas mentioned by the user into areaNames. Only handles music playback (not video/movie).",
+      "applicable_device_types": ["music_player"],
+      "parameters": {
+        "query": {
+          "type": "string",
+          "required": true,
+          "description": "Search keywords for music"
+        },
+        "areaNames": {
+          "type": "array",
+          "items": {"type": "string"},
+          "nullable": true,
+          "description": "Area names where to play music"
+        },
+        "forceOccupy": {
+          "type": "boolean",
+          "required": true,
+          "description": "Force occupy if player is busy (default false)"
+        }
+      },
+      "embedding_text": "music_play: Search and play music. Use for: play music, play a song, play jazz, play some relaxing music, play music in living room",
+      "example_queries": ["play some music", "play jazz in the living room", "play relaxing music", "play Ed Sheeran"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "music_control",
+      "description": "Control music playback: PAUSE, UNPAUSE (resume), or STOP.",
+      "description_en": "Control music playback (PAUSE, UNPAUSE, STOP) on a music player by playerId. Use the playerId from the music player context.",
+      "applicable_device_types": ["music_player"],
+      "parameters": {
+        "playerId": {
+          "type": "string",
+          "required": true,
+          "description": "ID of the music player"
+        },
+        "command": {
+          "type": "string",
+          "enum": ["PAUSE", "UNPAUSE", "STOP"],
+          "required": true,
+          "description": "Control command"
+        }
+      },
+      "embedding_text": "music_control: Control music playback - pause, resume/unpause, stop. Use for: pause music, stop music, resume music, continue playing",
+      "example_queries": ["pause the music", "stop the music", "resume playing", "continue the song"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "get_camera_snapshot",
+      "description": "Get a snapshot image from a specific camera by ID.",
+      "description_en": "Call this function to get a snapshot image from the specific camera. Provide cameraId to fetch the snapshot immediately. If cameraId is invalid -> CAMERA_NOT_FOUND. If camera is offline -> CAMERA_OFFLINE.",
+      "applicable_device_types": ["camera"],
+      "parameters": {
+        "cameraId": {
+          "type": "string",
+          "required": true,
+          "description": "ID of the camera to fetch snapshot from"
+        }
+      },
+      "embedding_text": "get_camera_snapshot: Get camera snapshot/image. Use for: show camera, view camera, check camera, see what's happening, security camera, take a picture from camera",
+      "example_queries": ["show me the camera", "check the front door camera", "what does the backyard camera see", "view security camera"]
+    },
+##新增如下##
+    {
+      "type": "tool",
+      "tool_name": "ptz_get_capabilities",
+      "description": "Query PTZ channel capabilities (supported controls).",
+      "description_en": "Call this function to query PTZ channel capabilities (supported controls). Provide channelId.",
+      "applicable_device_types": ["ptz_camera"],
+      "parameters": {
+        "channelId": {
+          "type": "string",
+          "required": true,
+          "description": "PTZ channel ID (e.g., 1, 2)"
+        }
+      },
+      "embedding_text": "ptz_get_capabilities: Query PTZ camera capabilities. Use for: PTZ capability, PTZ support",
+      "example_queries": ["PTZ capabilities", "what PTZ controls are supported"]
+    },
+    {
+      "type": "tool",
+      "tool_name": "ptz_get_status",
+      "description": "Query PTZ channel status (position/zoom/movement).",
+      "description_en": "Call this function to query PTZ channel status (position/zoom/movement). Provide channelId.",
+      "applicable_device_types": ["ptz_camera"],
+      "parameters": {
+        "channelId": {
+          "type": "string",
+          "required": true,
+          "description": "PTZ channel ID (e.g., 1, 2)"
+        }
+      },
+      "embedding_text": "ptz_get_status: Query PTZ camera status. Use for: PTZ status, pan tilt status, zoom status, check PTZ position",
+      "example_queries": ["query PTZ status", "check PTZ position", "PTZ zoom status"]
+    }
+  ],
+  "statistics": {
+    "total_tools": 13
+  }
+}
+
+
+2026/2/24运行日志2：
+konnextadmin@konnextadmin:/opt/ai$ pm2 logs --lines 1000 | grep -i "ptz"
+1|konnext- | [2026-02-24 14:38:07.921 +1100] INFO: [DualKBRoute] "查看ptz信息..." | Control: no(0.00) | Vision: no(0.00) | Compound: false | Agent: ptz | Time: 5418ms
+1|konnext- | [2026-02-24 14:38:07.935 +1100] DEBUG: [IntentService] Multi-intent detected: ptz_camera(0.90) vs camera(0.70), dominance=0.20
+1|konnext- | [2026-02-24 14:38:07.936 +1100] INFO: [IntentService] LLM parsing required: multi_intent_no_conjunction for query "查看ptz信息..."
+1|konnext- | [2026-02-24 14:38:08.457 +1100] INFO: [Route] "查看ptz信息..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=5957ms
+1|konnext- | [2026-02-24 14:38:08.457 +1100] INFO: [Router] Starting LLM route for command: "查看ptz信息"
+1|konnext- | [2026-02-24 14:39:08.546 +1100] INFO: [Router] Fallback: using RAG agentType=ptz, confidence=low
+1|konnext- | [2026-02-24 14:39:08.546 +1100] INFO: [Factory] Router LLM fallback: routeType=ptz, isCompound=false, time=66048ms
+1|konnext- | [2026-02-24 14:39:08.546 +1100] INFO: [Router] Completed in 66048ms: routeType=ptz, isCompound=false, intents=[ptz]
+1|konnext-ai   | [2026-02-24 23:38:19.188 +1100] INFO: Request DTO: {"sessionId":"3288f5d0-08fc-4b80-913b-d361bd52a97a","command":"查看ptz信息","language":"zh_CN"}
+1|konnext-ai   | [2026-02-24 23:38:19.192 +1100] INFO: Processing command in session 3288f5d0-08fc-4b80-913b-d361bd52a97a: 查看ptz信息
+1|konnext-ai   | [2026-02-24 23:38:19.612 +1100] INFO: [Router] Starting for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "查看ptz信息"
+1|konnext-ai   | [2026-02-24 23:38:24.066 +1100] INFO: [DualKBRoute] "查看ptz信息..." | Control: no(0.00) | Vision: no(0.00) | Compound: false | Agent: ptz | Time: 4410ms
+1|konnext-ai   | [2026-02-24 23:38:24.155 +1100] DEBUG: [IntentService] Multi-intent detected: ptz_camera(0.90) vs camera(0.70), dominance=0.20
+1|konnext-ai   | [2026-02-24 23:38:24.157 +1100] INFO: [IntentService] LLM parsing required: multi_intent_no_conjunction for query "查看ptz信息..."
+1|konnext-ai   | [2026-02-24 23:38:24.307 +1100] INFO: [Route] "查看ptz信息..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=4684ms
+1|konnext-ai   | [2026-02-24 23:38:24.308 +1100] INFO: [Factory] PTZ explicit fast-path: confidence=low, time=4691ms
+1|konnext-ai   | [2026-02-24 23:38:24.308 +1100] INFO: [Router] Completed in 4696ms: routeType=ptz, isCompound=false, intents=[ptz]
+1|konnext-ai   | [2026-02-24 23:38:24.336 +1100] INFO: [Router] Single task, routing to: ptzAgent
+1|konnext-ai   | [2026-02-24 23:38:24.364 +1100] INFO: [PtzAgent] Processing for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83
+1|konnext-ai   | [2026-02-24 23:38:24.366 +1100] INFO: [PtzContext] Building for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "查看ptz信息"
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-02-24 23:38:24.369 +1100] DEBUG: Tool description cache miss for: ptz_get_capabilities_zh_CN, creating new description
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-02-24 23:38:24.381 +1100] DEBUG: Tool description cache miss for: ptz_get_status_zh_CN, creating new description
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-02-24 23:38:24.382 +1100] INFO: [PtzContext] Built in 15ms, tools: 2, messages: 0
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-02-24 23:40:09.068 +1100] ERROR: [PtzAgent] Error: AbortError: Request was aborted.
+相比bug1有明显的进展：可以看出第一个error出现在[PtzAgent]-->表明开始进入langgraph链路
+
+
+且对于LangSmith日志，在PtzAgent这一栏：显示error:
+Error: Abort
+    at EventTarget.listener (/opt/ai/node_modules/@langchain/langgraph/src/pregel/runner.ts:300:14)
+    at EventTarget.[nodejs.internal.kHybridDispatch] (node:internal/event_target:831:20)
+    at EventTarget.dispatchEvent (node:internal/event_target:766:26)
+    at abortSignal (node:internal/abort_controller:370:10)
+    at node:internal/abort_controller:373:20
+    at Set.forEach (<anonymous>)
+    at abortSignal (node:internal/abort_controller:371:30)
+    at Timeout._onTimeout (node:internal/abort_controller:127:7)
+    at listOnTimeout (node:internal/timers:581:17)
+    at processTimers (node:internal/timers:519:7)
+
+问题分析：
+从日志可以看出，用户发送"查看ptz信息..."命令后，系统：
+正确识别到了PTZ意图（ptz_camera得分0.90）
+路由到了PtzAgent节点
+PtzAgent开始处理，构建了上下文并获取了2个PTZ工具
+但在LLM调用阶段发生了超时中断（AbortError）
+
+根因：上游超时/取消信号触发 → LangGraph 把 signal 传给子 runnable → ChatOpenAI 调用被 abort → 抛 AbortError
+
+核心问题定位：
+你这次从 23:38:24 → 23:40:09 大约 105 秒才 abort，说明 “60秒超时”不一定是唯一的 abort 来源；但无论谁触发 abort，你当前代码的问题是：
+ptzAgent 对 AbortError 没有“区分处理”
+LLM 调用没有设置一个“明确、可控的请求超时”（只靠外层 abort，体验会很差：卡很久然后炸）
+Graph 的 timeout 写死 60s，不可配置（不同环境/模型延迟不同）
+
+让系统在 LLM/网络慢的时候做到：
+1.可控超时：例如 25~45 秒内给出“正在处理/稍后再试”的稳定响应，而不是卡 100 秒再炸
+2.错误可解释：AbortError 不再只打一个 error log，而是告诉你“谁触发了取消、耗时多久、当时在做什么”
+3.可配置：通过环境变量/配置调整 timeout，而不是改代码
+
+优化过程：
+

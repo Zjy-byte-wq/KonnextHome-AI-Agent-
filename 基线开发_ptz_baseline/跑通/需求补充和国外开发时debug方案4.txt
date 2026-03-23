@@ -1,0 +1,116 @@
+问题分析和需求补充：
+
+在生产环境下，应先补救安全基线：移除默认 PTZ 账号密码回退。 
+
+配置层存在默认 PTZ 地址和默认账号密码，生产环境漏配时会“静默使用默认值”，风险高。
+app.config.ts (line 17)
+
+位置“/opt/ai/src/config/app.config.ts”
+“
+  ptzProgram: {
+    url: process.env.PTZ_URL || "http://172.16.10.202:80",
+    username: process.env.PTZ_USERNAME || "admin",
+    password: process.env.PTZ_PASSWORD || "Admin.123",
+  },
+”
+业务层再次兜底默认值，导致即使配置层收紧，运行时仍可能连到默认设备。
+ptz-http-client.service.ts (line 29)
+整体表现为“错配置不报错”，问题暴露晚，定位成本高。
+位置/opt/ai/src/http-client/ptz-http-client.service.ts
+“
+@Injectable()
+export class PtzHttpClientService {
+  private readonly baseUrl: string;
+  private readonly username: string;
+  private readonly password: string;
+  private nonceCount = 0;
+
+  constructor(
+    @InjectPinoLogger(PtzHttpClientService.name)
+    private readonly logger: PinoLogger,
+    private readonly httpService: HttpService,
+    private readonly configService: ConfigService,
+  ) {
+    const cfgUrl = this.configService.get<string>("ptzProgram.url");
+    this.baseUrl = (cfgUrl || "http://172.16.10.202:80").replace(/\/+$/, "");
+    this.username =
+      this.configService.get<string>("ptzProgram.username") || "admin";
+    this.password =
+      this.configService.get<string>("ptzProgram.password") || "Admin.123";
+  }
+”
+
+改后目的：
+PTZ 配置改为“必填”，缺失即启动失败（fail-fast）。
+完全移除默认账号密码与默认 IP，避免误连和弱口令风险。
+保证配置来源单一、行为可预期。
+
+解决方案：
+**优化方案（移除 PTZ 默认账号密码回退）**
+
+**1. 现存问题**
+1. 配置层存在默认 PTZ 地址和默认账号密码，生产环境漏配时会“静默使用默认值”，风险高。  
+[app.config.ts](/opt/ai/src/config/app.config.ts:17)
+2. 业务层再次兜底默认值，导致即使配置层收紧，运行时仍可能连到默认设备。  
+[ptz-http-client.service.ts](/opt/ai/src/http-client/ptz-http-client.service.ts:29)
+3. 整体表现为“错配置不报错”，问题暴露晚，定位成本高。
+
+**2. 改后目的**
+1. PTZ 配置改为“必填”，缺失即启动失败（fail-fast）。
+2. 完全移除默认账号密码与默认 IP，避免误连和弱口令风险。
+3. 保证配置来源单一、行为可预期。
+
+**3. 改动前（文件名 + 代码块）**
+
+[app.config.ts](/opt/ai/src/config/app.config.ts:17)
+```ts
+ptzProgram: {
+  url: process.env.PTZ_URL || "http://172.16.10.202:80",
+  username: process.env.PTZ_USERNAME || "admin",
+  password: process.env.PTZ_PASSWORD || "Admin.123",
+},
+```
+
+[ptz-http-client.service.ts](/opt/ai/src/http-client/ptz-http-client.service.ts:29)
+```ts
+const cfgUrl = this.configService.get<string>("ptzProgram.url");
+this.baseUrl = (cfgUrl || "http://172.16.10.202:80").replace(/\/+$/, "");
+this.username =
+  this.configService.get<string>("ptzProgram.username") || "admin";
+this.password =
+  this.configService.get<string>("ptzProgram.password") || "Admin.123";
+```
+
+**4. 改动后（文件名 + 代码块）**
+
+[app.config.ts](/opt/ai/src/config/app.config.ts)
+```ts
+ptzProgram: {
+  url: process.env.PTZ_URL,
+  username: process.env.PTZ_USERNAME,
+  password: process.env.PTZ_PASSWORD,
+},
+```
+
+[ptz-http-client.service.ts](/opt/ai/src/http-client/ptz-http-client.service.ts)
+```ts
+const cfgUrl = this.configService.get<string>("ptzProgram.url");
+const cfgUsername = this.configService.get<string>("ptzProgram.username");
+const cfgPassword = this.configService.get<string>("ptzProgram.password");
+
+if (!cfgUrl || !cfgUsername || !cfgPassword) {
+  throw new Error(
+    "[PTZ] Missing required config: PTZ_URL/PTZ_USERNAME/PTZ_PASSWORD",
+  );
+}
+
+this.baseUrl = cfgUrl.replace(/\/+$/, "");
+this.username = cfgUsername;
+this.password = cfgPassword;
+```
+
+**5. 改动后解决了什么问题**
+1. 解决默认凭据风险：不会再使用 `admin/Admin.123` 这类弱口令回退。
+2. 解决误连风险：不会在漏配时自动连默认 `172.16.10.202`。
+3. 解决隐性故障：配置缺失在启动阶段即暴露，不会拖到线上请求时才发现。
+4. 提高可运维性：环境配置错误更快定位，部署行为更一致。

@@ -1,0 +1,90 @@
+2026.3.12
+当前已打通ptz抓图链路，capturetool返回如下：
+{
+  "toolResults": [
+    {
+      "executionTime": 7675,
+      "result": "{\"success\":true,\"code\":\"OK\",\"action\":\"query\",\"message\":\"PTZ snapshot captured successfully.\",\"channelId\":\"101\",\"cloudUrl\":\"https://astra-ai-snapshot.s3.ap-southeast-2.amazonaws.com/dev/1773279203102-f7f8a4fa-d723-4c3f-9316-1795c26b84a9.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIA5PHAIXI5F2LSEOYK%2F20260312%2Fap-southeast-2%2Fs3%2Faws4_request&X-Amz-Date=20260312T013323Z&X-Amz-Expires=120&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEJ%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaDmFwLXNvdXRoZWFzdC0yIkgwRgIhALSUje3dFBDZeMO7jk8wnXblrhYd9rdZoU3lqAozWUGwAiEA5c2gG0Hi75rrx%2B23sd%2FMJGS68LiUdHkBURwOdVz8lHEqiAMIaBABGgw5MjYwMzU3ODYyOTgiDD2zUMmSRU38pqPmuCrlAk5vugm5igqoQtccNmAbTgJaUWas3BH4KM0QgsgSBZT3g6HaSamAsMnojzx4w9nc55L67gJHtZogzD6FI0Km6nsvaT0vaYH6%2BKkHaVZxPfsCjFjAS5nQlNnOMXql6XfpRJ2WOMKWBoadcP5SWcTkzEyPaWK0PTCz%2F5xDsz%2BnPHhVHLXWJMyKGIdGtEbqBpwj1ndMNY%2FnxuDiLsE86EzR%2B5GzlOXbQVK1YgwLziEIzSABsTbDGhcIMY%2BzzfshIOPbLAv1Oyy5of%2FzAwlg2PYnWepeKauklcoortkI6O%2FY3NuxDOSlXdlr4RpaVcmYvyVKDW6O4Eu3F6rJ4sWVyTgUlzPx4c8fNqNr%2B%2BKCEiKC8Px4SXmrX6BAHL3LGni%2BNN%2Bga7u1dBKwiW1hQrVDnC8MuHY3W93idKoUGIS%2FT5AJL0ynLuPWjAZU2j0NKgKiu77qP9cPf7%2B9xYR0vKawSVTM5WP5i%2FD3hTCz8MfNBjqcAT4xRdZnB5qNn9BXbzJqu8FmXrW7026hjQL2O7e%2FJUZ5Mk56VauWc%2B4me1onupE1lQdIWZDZEY6R6OqRWAtnF1CNSH3CgIU5HWUGj%2B3SOHinZNCGl8hYVDnFf6qRwSe7H0555Mno%2Biq8uCQYtG2JveFrlXzl%2FysVFaTQFIz%2BOWR1YoPgsnO8736RIDylkv%2Bo9VRtaGlw6jkS6Twbag%3D%3D&X-Amz-Signature=a31ee6d08089685e01d98d7d5da920d7d93b2468b8ee11f7beebd6c12a0c1d69&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject\",\"data\":{\"url\":\"https://astra-ai-snapshot.s3.ap-southeast-2.amazonaws.com/dev/1773279203102-f7f8a4fa-d723-4c3f-9316-1795c26b84a9.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIA5PHAIXI5F2LSEOYK%2F20260312%2Fap-southeast-2%2Fs3%2Faws4_request&X-Amz-Date=20260312T013323Z&X-Amz-Expires=120&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEJ%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaDmFwLXNvdXRoZWFzdC0yIkgwRgIhALSUje3dFBDZeMO7jk8wnXblrhYd9rdZoU3lqAozWUGwAiEA5c2gG0Hi75rrx%2B23sd%2FMJGS68LiUdHkBURwOdVz8lHEqiAMIaBABGgw5MjYwMzU3ODYyOTgiDD2zUMmSRU38pqPmuCrlAk5vugm5igqoQtccNmAbTgJaUWas3BH4KM0QgsgSBZT3g6HaSamAsMnojzx4w9nc55L67gJHtZogzD6FI0Km6nsvaT0vaYH6%2BKkHaVZxPfsCjFjAS5nQlNnOMXql6XfpRJ2WOMKWBoadcP5SWcTkzEyPaWK0PTCz%2F5xDsz%2BnPHhVHLXWJMyKGIdGtEbqBpwj1ndMNY%2FnxuDiLsE86EzR%2B5GzlOXbQVK1YgwLziEIzSABsTbDGhcIMY%2BzzfshIOPbLAv1Oyy5of%2FzAwlg2PYnWepeKauklcoortkI6O%2FY3NuxDOSlXdlr4RpaVcmYvyVKDW6O4Eu3F6rJ4sWVyTgUlzPx4c8fNqNr%2B%2BKCEiKC8Px4SXmrX6BAHL3LGni%2BNN%2Bga7u1dBKwiW1hQrVDnC8MuHY3W93idKoUGIS%2FT5AJL0ynLuPWjAZU2j0NKgKiu77qP9cPf7%2B9xYR0vKawSVTM5WP5i%2FD3hTCz8MfNBjqcAT4xRdZnB5qNn9BXbzJqu8FmXrW7026hjQL2O7e%2FJUZ5Mk56VauWc%2B4me1onupE1lQdIWZDZEY6R6OqRWAtnF1CNSH3CgIU5HWUGj%2B3SOHinZNCGl8hYVDnFf6qRwSe7H0555Mno%2Biq8uCQYtG2JveFrlXzl%2FysVFaTQFIz%2BOWR1YoPgsnO8736RIDylkv%2Bo9VRtaGlw6jkS6Twbag%3D%3D&X-Amz-Signature=a31ee6d08089685e01d98d7d5da920d7d93b2468b8ee11f7beebd6c12a0c1d69&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject\",\"size_bytes\":355145,\"width\":1920,\"height\":1080,\"ts\":\"20260312-123315\"},\"openaiContent\":[{\"type\":\"text\",\"text\":\"PTZ snapshot captured successfully.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://astra-ai-snapshot.s3.ap-southeast-2.amazonaws.com/dev/1773279203102-f7f8a4fa-d723-4c3f-9316-1795c26b84a9.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIA5PHAIXI5F2LSEOYK%2F20260312%2Fap-southeast-2%2Fs3%2Faws4_request&X-Amz-Date=20260312T013323Z&X-Amz-Expires=120&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEJ%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaDmFwLXNvdXRoZWFzdC0yIkgwRgIhALSUje3dFBDZeMO7jk8wnXblrhYd9rdZoU3lqAozWUGwAiEA5c2gG0Hi75rrx%2B23sd%2FMJGS68LiUdHkBURwOdVz8lHEqiAMIaBABGgw5MjYwMzU3ODYyOTgiDD2zUMmSRU38pqPmuCrlAk5vugm5igqoQtccNmAbTgJaUWas3BH4KM0QgsgSBZT3g6HaSamAsMnojzx4w9nc55L67gJHtZogzD6FI0Km6nsvaT0vaYH6%2BKkHaVZxPfsCjFjAS5nQlNnOMXql6XfpRJ2WOMKWBoadcP5SWcTkzEyPaWK0PTCz%2F5xDsz%2BnPHhVHLXWJMyKGIdGtEbqBpwj1ndMNY%2FnxuDiLsE86EzR%2B5GzlOXbQVK1YgwLziEIzSABsTbDGhcIMY%2BzzfshIOPbLAv1Oyy5of%2FzAwlg2PYnWepeKauklcoortkI6O%2FY3NuxDOSlXdlr4RpaVcmYvyVKDW6O4Eu3F6rJ4sWVyTgUlzPx4c8fNqNr%2B%2BKCEiKC8Px4SXmrX6BAHL3LGni%2BNN%2Bga7u1dBKwiW1hQrVDnC8MuHY3W93idKoUGIS%2FT5AJL0ynLuPWjAZU2j0NKgKiu77qP9cPf7%2B9xYR0vKawSVTM5WP5i%2FD3hTCz8MfNBjqcAT4xRdZnB5qNn9BXbzJqu8FmXrW7026hjQL2O7e%2FJUZ5Mk56VauWc%2B4me1onupE1lQdIWZDZEY6R6OqRWAtnF1CNSH3CgIU5HWUGj%2B3SOHinZNCGl8hYVDnFf6qRwSe7H0555Mno%2Biq8uCQYtG2JveFrlXzl%2FysVFaTQFIz%2BOWR1YoPgsnO8736RIDylkv%2Bo9VRtaGlw6jkS6Twbag%3D%3D&X-Amz-Signature=a31ee6d08089685e01d98d7d5da920d7d93b2468b8ee11f7beebd6c12a0c1d69&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject\",\"detail\":\"auto\"}}],\"langchainContent\":[{\"type\":\"text\",\"text\":\"PTZ snapshot captured successfully.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://astra-ai-snapshot.s3.ap-southeast-2.amazonaws.com/dev/1773279203102-f7f8a4fa-d723-4c3f-9316-1795c26b84a9.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIA5PHAIXI5F2LSEOYK%2F20260312%2Fap-southeast-2%2Fs3%2Faws4_request&X-Amz-Date=20260312T013323Z&X-Amz-Expires=120&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEJ%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaDmFwLXNvdXRoZWFzdC0yIkgwRgIhALSUje3dFBDZeMO7jk8wnXblrhYd9rdZoU3lqAozWUGwAiEA5c2gG0Hi75rrx%2B23sd%2FMJGS68LiUdHkBURwOdVz8lHEqiAMIaBABGgw5MjYwMzU3ODYyOTgiDD2zUMmSRU38pqPmuCrlAk5vugm5igqoQtccNmAbTgJaUWas3BH4KM0QgsgSBZT3g6HaSamAsMnojzx4w9nc55L67gJHtZogzD6FI0Km6nsvaT0vaYH6%2BKkHaVZxPfsCjFjAS5nQlNnOMXql6XfpRJ2WOMKWBoadcP5SWcTkzEyPaWK0PTCz%2F5xDsz%2BnPHhVHLXWJMyKGIdGtEbqBpwj1ndMNY%2FnxuDiLsE86EzR%2B5GzlOXbQVK1YgwLziEIzSABsTbDGhcIMY%2BzzfshIOPbLAv1Oyy5of%2FzAwlg2PYnWepeKauklcoortkI6O%2FY3NuxDOSlXdlr4RpaVcmYvyVKDW6O4Eu3F6rJ4sWVyTgUlzPx4c8fNqNr%2B%2BKCEiKC8Px4SXmrX6BAHL3LGni%2BNN%2Bga7u1dBKwiW1hQrVDnC8MuHY3W93idKoUGIS%2FT5AJL0ynLuPWjAZU2j0NKgKiu77qP9cPf7%2B9xYR0vKawSVTM5WP5i%2FD3hTCz8MfNBjqcAT4xRdZnB5qNn9BXbzJqu8FmXrW7026hjQL2O7e%2FJUZ5Mk56VauWc%2B4me1onupE1lQdIWZDZEY6R6OqRWAtnF1CNSH3CgIU5HWUGj%2B3SOHinZNCGl8hYVDnFf6qRwSe7H0555Mno%2Biq8uCQYtG2JveFrlXzl%2FysVFaTQFIz%2BOWR1YoPgsnO8736RIDylkv%2Bo9VRtaGlw6jkS6Twbag%3D%3D&X-Amz-Signature=a31ee6d08089685e01d98d7d5da920d7d93b2468b8ee11f7beebd6c12a0c1d69&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject\"}}]}",
+      "success": true,
+      "toolCallId": "call_g1Uy9cxntPpZr0TytGUAiNE8",
+      "toolName": "capture_frame_tool"
+    }
+  ]
+}
+
+
+问题：llm回答的是抱歉，我无法帮助识别或分析这张图片中的具体内容
+
+分析：
+
+这个结果本身是**成功**的，说明 PTZ 全链路已通：
+
+1. `capture_frame_tool` 返回 `success=true`
+2. 有 `cloudUrl`（S3 预签名链接）
+3. 有图片元数据：`1920x1080`、`355145 bytes`
+4. `executionTime=7675ms`，在 8s 超时边缘但这次没超时
+
+所以你现在的问题不在 PTZ 上传，而在“后续 LLM看图回答”阶段。
+
+最可能原因：
+
+1. 预签名 URL 过期太短  
+你这个 URL 里 `X-Amz-Expires=120`（仅 120 秒），LLM二次取图时可能已过期或边缘失效。
+
+2. LLM安全策略拒答  
+如果你的问题带“识别是谁/具体身份”等，模型会拒绝，表现为“无法帮助识别或分析具体内容”。
+
+3. 看图阶段偶发取图失败  
+即使抓拍成功，LLM端拉取外链偶发失败也会出现类似拒答。
+
+你可以立刻做两个定位动作：
+
+1. 抓拍成功后立刻用同一个 `cloudUrl` 手动访问，确认 120 秒内可打开。  
+2. 用同一 URL 直接调用 `analyze_image_tool` 做一次“中性描述”（例如“请描述画面内容，不要识别人名”），看能否稳定出结果。
+
+如果你要，我可以下一步直接给你补丁，做两件事：
+1. 把看图阶段的提示和消息结构改得更稳（减少拒答）。  
+2. 在主程序把预签名过期时间从 120 秒提高到 600 秒以上。
+
+有可能，但不是主要矛盾。
+
+你这份 `capture_frame_tool` 结果里，真正给 LLM 看图用的是 `langchainContent` 的 `image_url`，不是让 LLM“读完整大 JSON”。这条链路代码会先解析 JSON 再抽取图片消息。
+
+更关键的问题通常是：
+
+1. `cloudUrl` 太长且有效期短（你这里 `X-Amz-Expires=120`）。  
+2. 最终回答阶段的 prompt 命中了模型安全限制（例如“识别具体人/身份”）。  
+3. 看图请求里只放了图片消息，用户问题文本没有单独附加（当前单任务路径确实有这个风险）。
+
+所以“JSON复杂”是次要风险；主风险是**URL时效 + 看图阶段消息组织/策略**。  
+如果你同意，我可以直接改成：看图时把 `state.command` 作为文本一并发送，并在日志里打印“是否成功取到图片内容”的关键埋点。
+
+
+改动内容：---->在ai仓库中压缩抓图工具的cloudUrl输出，不要输出很长的cloudUrl
+推荐最小方案（只改 AI）
+让 LLM 看图时使用 data:image/...;base64,...，而不是 cloudUrl。
+
+文件：ptz-camera.tool.provider.ts
+
+当前 buildCaptureSuccess 里：
+
+openaiContent / langchainContent 的 image_url.url 用的是 cloudUrl
+改成：
+
+image_url.url 用 data:image/jpeg;base64,...（可用已压缩后的 base64）
+cloudUrl 仍保留在返回字段里给前端/日志使用
+这样解决：
+
+LLM 不再依赖超长、短时效签名 URL
+避免 X-Amz-Expires=120 导致模型二次拉图失败
+改动点 2（可选）
+文件：multi-agent-graph.ts
+
+你已经改了“用户问题文本单独附加”，这一步保留即可。
+如果担心 payload 太大，可在 PTZ 侧把 inline 图片进一步压到 1024px / quality 70。
+
+
+测试结果：
+ "response": "画面显示一个住宅区的户外场景。左侧是砖墙建筑，前方有一个小花园，种植着修剪整齐的灌木和树木。花园中有一个黄色的装饰物。远处可以看到一条街道和更多的树木，环境看起来宁静而绿意盎然。",
+
+至此位置，抓图链路完全跑通

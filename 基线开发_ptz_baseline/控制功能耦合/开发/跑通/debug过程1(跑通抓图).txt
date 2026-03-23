@@ -1,0 +1,66 @@
+### 本次debug目的 -->没有任何错误跑通###
+
+
+后端日志：
+1|konnext-ai   | [2026-03-09 18:21:39.923 +1100] INFO: [Route] "我想要ptz摄像头的当前画面..." → agent=ptz, compound=false, confidence=low, score=0.00, tools=[], time=2530ms
+1|konnext-ai   | [2026-03-09 18:21:39.924 +1100] INFO: [Factory] PTZ explicit fast-path: confidence=low, time=2531ms
+1|konnext-ai   | [2026-03-09 18:21:39.924 +1100] INFO: [Router] Completed in 2532ms: routeType=ptz, isCompound=false, intents=[ptz]
+1|konnext-ai   | [2026-03-09 18:21:39.933 +1100] INFO: [Router] Single task, routing to: ptzAgent
+1|konnext-ai   | [2026-03-09 18:21:39.947 +1100] INFO: [PtzAgent] Processing for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83
+1|konnext-ai   | [2026-03-09 18:21:39.947 +1100] INFO: [PtzContext] Building for user da12ce9e-9843-43b8-af1c-c6bcbd28fe83, command: "我想要ptz摄像头的当前画面"
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-09 18:21:39.947 +1100] DEBUG: Tool description cache hit for: ptz_get_capabilities_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-09 18:21:39.947 +1100] DEBUG: Tool description cache hit for: ptz_get_status_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-09 18:21:39.948 +1100] INFO: [PtzContext] Built in 1ms, tools: 7, messages: 0
+1|konnext-ai   |     context: "PtzContextBuilder"
+1|konnext-ai   | [2026-03-09 18:21:41.838 +1100] INFO: 💰 [ptzAgent] Cost: $0.001838, Tokens: 635+25
+1|konnext-ai   | [2026-03-09 18:21:41.858 +1100] DEBUG: Tool description cache hit for: ptz_get_capabilities_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-09 18:21:41.858 +1100] DEBUG: Tool description cache hit for: ptz_get_status_zh_CN
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   |     context: "PtzCameraToolProvider"
+1|konnext-ai   | [2026-03-09 18:21:48.931 +1100] DEBUG: [AggregateResults] Updated context: location=undefined, deviceType=ptz_camera, targetName=undefined
+
+LangSmith日志：capture_frame_tool输出为{"success":false,"code":"PUBLIC_URL_UNREACHABLE","action":"query","error":"URL unreachable: This operation was aborted"}
+
+
+
+问题分析：
+问题点已经比较明确了，不在路由，也不在 PTZ 抓拍本身，而在“抓拍后公网 URL 自检”。
+
+路由正常：你日志里已到 ptzAgent，并执行了 PTZ 上下文构建。
+capture_frame_tool 的失败码是 PUBLIC_URL_UNREACHABLE，错误是 This operation was aborted，这和代码中的 5 秒超时中断一致（AbortController）。
+代码路径是：先抓拍并写本地文件，再拼 NGROK_URL/data/xxx.jpg 做 fetch 探测；探测失败就整体返回失败。
+参考：
+captureFrame 逻辑 (line 463)
+probePublicUrl + 5s abort (line 436)
+失败返回 PUBLIC_URL_UNREACHABLE (line 500)
+NGROK_URL 默认值 (line 23)
+我本地看到当时文件已落盘，说明相机抓图大概率成功：snap_20260309-182141.jpg
+最可能根因（按概率）：
+
+NGROK_URL 没有配置，走了硬编码默认 ngrok 域名（通常会失效/轮换）。
+ngrok 隧道没在运行或域名变了。
+后端机器到该公网域名网络不通或 5 秒超时过短。
+建议先做这 3 个验证：
+
+确认进程环境里 NGROK_URL 是否为当前有效隧道地址。
+在服务机器上直接访问 NGROK_URL/data/刚生成的文件名.jpg。
+若偶发超时，先把 probePublicUrl 超时从 5000ms 提高到 10000ms 做对比。
+如果你要，我可以下一步直接给你改一版：captureFrame 在公网探测失败时仍返回本地 path（标记 url_unreachable），避免“抓拍成功但整体判失败”。
+
+
+解决方案：
+复用普通camera抓图接口(不提供cameraid的)，设计ptz工具

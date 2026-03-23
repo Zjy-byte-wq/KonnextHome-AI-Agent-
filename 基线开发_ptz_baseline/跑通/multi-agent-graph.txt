@@ -1,0 +1,2213 @@
+import {
+  StateGraph,
+  END,
+  START,
+  MemorySaver,
+  LangGraphRunnableConfig,
+} from "@langchain/langgraph";
+import {
+  StateAnnotation,
+  GraphState,
+  ToolCall,
+  ToolResult,
+  MultiAgentRouteResult,
+  AgentExecutionResult,
+} from "./state";
+import { ChatOpenAI } from "@langchain/openai";
+import { ToolProvider } from "../tools/tool.provider";
+import { ChatbotService } from "../chatbot.service";
+import { PinoLogger } from "nestjs-pino";
+import { ChatbotSupportedLanguage } from "../models/chatbot_command.dto";
+import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
+import { StructuredToolInterface } from "@langchain/core/tools";
+import { v4 as uuidv4 } from "uuid";
+import { calculateLlmCost } from "../tools/price";
+import {
+  ContextBuilderFactory,
+  RouterResult,
+  RouteType,
+  AgentContext,
+  ContextBuildInput,
+  mapIntentToRouteType,
+  IntentType,
+  ConversationContext,
+  isContextExpired,
+  updateContextTimestamp,
+} from "../context-builder";
+import { CameraToolProvider } from "../tools/camera.tool.provider";
+import { PtzCameraToolProvider } from "../tools/ptz-camera.tool.provider";
+import {
+  getNodeForTool,
+  getIntentForTool,
+  extractLocation,
+} from "../constants/device-mappings";
+import { toPrismaLanguage } from "../utils/language.util";
+import {
+  getTrivialGreetingResponse,
+  isTrivialGreeting,
+} from "../utils/smalltalk.util";
+
+/**
+ * Multi-Agent Graph
+ *
+ * 方案A: 分开处理架构
+ * - Router 节点：快速意图检测，路由到对应 Agent
+ * - Home Control Agent：设备控制（灯、窗帘、空调等）
+ * - Vision Agent：摄像头相关（快照、分析）
+ * - General Agent：通用对话
+ */
+export class MultiAgentGraph {
+  private llm: ChatOpenAI;
+  private llmGpt5: ChatOpenAI; // gpt-5 用于生成用户回复
+  private graph: any;
+  private checkpointer: MemorySaver;
+
+  get modelName(): string {
+    return this.llm.modelName || "gpt-4o";
+  }
+
+  /**
+   * 为节点内部的嵌套 Runnable（LLM / tools）构建子级 config。
+   *
+   * - 去掉 LangGraph 节点的 `runId`，避免子 run 覆盖/折叠（LangSmith 里看不到 ChatOpenAI）
+   * - 保留 callbacks 以便把子 run 挂在当前 trace 下面
+   * - 强制 `_awaitHandler:false`，避免 callbacks 阻塞导致时延变长
+   */
+  private childRunConfig(
+    config: LangGraphRunnableConfig | undefined,
+    runName: string,
+  ): LangGraphRunnableConfig {
+    const base: LangGraphRunnableConfig = config ? { ...config } : {};
+    delete (base as any).runId;
+    delete (base as any).runName;
+    return {
+      ...base,
+      runName,
+      _awaitHandler: false,
+    } as LangGraphRunnableConfig;
+  }
+
+  constructor(
+    private readonly toolProvider: ToolProvider,
+    private readonly cameraToolProvider: CameraToolProvider,
+    private readonly ptzToolProvider: PtzCameraToolProvider,
+    private readonly chatbotService: ChatbotService,
+    private readonly logger: PinoLogger,
+    private readonly contextBuilderFactory: ContextBuilderFactory,
+  ) {
+    this.llm = new ChatOpenAI({
+      temperature: 0,
+      model: "gpt-4o",
+    });
+
+    this.llmGpt5 = new ChatOpenAI({
+      temperature: 1,
+      model: "gpt-5",
+    });
+
+    this.checkpointer = new MemorySaver();
+    this.graph = this.buildGraph();
+  }
+
+  /**
+   * 构建 Multi-Agent Graph
+   */
+  private buildGraph() {
+    const builder = new StateGraph(StateAnnotation)
+      // ========== 路由层 ==========
+      .addNode("router", this.routerNode.bind(this))
+
+      // ========== Agent 层 ==========
+      .addNode("homeControlAgent", this.homeControlAgent.bind(this))
+      .addNode("visionAgent", this.visionAgent.bind(this))
+      .addNode("ptzAgent", this.ptzAgent.bind(this))
+      .addNode("generalAgent", this.generalAgent.bind(this))
+
+      // ========== 工具执行层（Home Control） ==========
+      .addNode("controlLight", this.controlLight.bind(this))
+      .addNode("controlCurtain", this.controlCurtain.bind(this))
+      .addNode("controlAircon", this.controlAircon.bind(this))
+      .addNode("controlUniSwitch", this.controlUniSwitch.bind(this))
+      .addNode("controlFloorHeating", this.controlFloorHeating.bind(this))
+      .addNode("controlScene", this.controlScene.bind(this))
+      .addNode("buildScene", this.buildScene.bind(this))
+      .addNode("musicPlay", this.musicPlay.bind(this))
+      .addNode("musicControl", this.musicControl.bind(this))
+
+      // ========== 工具执行层（Vision） ==========
+      .addNode("cameraSnapshot", this.cameraSnapshot.bind(this))
+      .addNode("cameraList", this.cameraList.bind(this))
+      .addNode("ptzGetCapabilities", this.ptzGetCapabilities.bind(this))
+      .addNode("ptzGetStatus", this.ptzGetStatus.bind(this))
+
+      // ========== 复合任务执行层 ==========
+      .addNode("compoundExecutor", this.compoundExecutor.bind(this))
+
+      // ========== 结果处理层 ==========
+      .addNode("aggregateResults", this.aggregateResults.bind(this))
+      .addNode("generateResponse", this.generateResponse.bind(this))
+      .addNode("compoundAggregator", this.compoundAggregator.bind(this))
+
+      // ========== 边定义 ==========
+      .addEdge(START, "router")
+      .addConditionalEdges("router", this.routeFromRouter.bind(this))
+
+      // Home Control Agent 路由
+      .addConditionalEdges(
+        "homeControlAgent",
+        this.routeFromHomeControl.bind(this),
+      )
+
+      // Vision Agent 路由
+      .addConditionalEdges("visionAgent", this.routeFromVision.bind(this))
+      .addConditionalEdges("ptzAgent", this.routeFromPtz.bind(this))
+
+      // General Agent 直接到响应
+      .addEdge("generalAgent", "generateResponse")
+
+      // 工具执行后汇总
+      .addEdge("controlLight", "aggregateResults")
+      .addEdge("controlCurtain", "aggregateResults")
+      .addEdge("controlAircon", "aggregateResults")
+      .addEdge("controlUniSwitch", "aggregateResults")
+      .addEdge("controlFloorHeating", "aggregateResults")
+      .addEdge("controlScene", "aggregateResults")
+      .addEdge("buildScene", "aggregateResults")
+      .addEdge("musicPlay", "aggregateResults")
+      .addEdge("musicControl", "aggregateResults")
+      .addEdge("cameraSnapshot", "aggregateResults")
+      .addEdge("cameraList", "aggregateResults")
+      .addEdge("ptzGetCapabilities", "aggregateResults")
+      .addEdge("ptzGetStatus", "aggregateResults")
+
+      // 汇总后生成响应
+      .addEdge("aggregateResults", "generateResponse")
+      .addEdge("compoundExecutor", "compoundAggregator")
+      .addEdge("compoundAggregator", "generateResponse")
+      .addEdge("generateResponse", END);
+
+    return builder.compile({ checkpointer: this.checkpointer });
+  }
+
+  // ========== Router 节点 ==========
+
+  /**
+   * Router 节点：执行意图检测和路由
+   */
+  private async routerNode(state: GraphState) {
+    const startTime = Date.now();
+
+    try {
+      this.logger.info(
+        `[Router] Starting for user ${state.userId}, command: "${state.command}"`,
+      );
+
+      // 检查 ConversationContext 是否过期
+      let conversationContext = state.conversationContext;
+      if (isContextExpired(conversationContext)) {
+        this.logger.info(`[Router] ConversationContext expired, clearing`);
+        conversationContext = undefined;
+      }
+
+      // 构建 ContextBuildInput
+      const input: ContextBuildInput = {
+        userId: state.userId,
+        command: state.command,
+        language: state.language,
+        messages: state.messages,
+        conversationContext,
+      };
+
+      // 执行路由
+      const routerResult: RouterResult =
+        await this.contextBuilderFactory.route(input);
+
+      const routingTime = Date.now() - startTime;
+
+      this.logger.info(
+        `[Router] Completed in ${routingTime}ms: ` +
+          `routeType=${routerResult.routeType}, ` +
+          `isCompound=${routerResult.isCompound}, ` +
+          `intents=[${routerResult.intents.map((i) => i.type).join(",")}]`,
+      );
+
+      // 构建 MultiAgentRouteResult
+      const multiAgentRouteResult: MultiAgentRouteResult = {
+        routeType: routerResult.routeType,
+        isCompound: routerResult.isCompound,
+        intents: routerResult.intents,
+        routingTime,
+        ragRouteResult: routerResult.ragRouteResult, // 传递 RAG 结果用于 Tool Gating
+      };
+
+      return {
+        routeResult: multiAgentRouteResult,
+        activeAgent: routerResult.routeType,
+      };
+    } catch (error) {
+      this.logger.error(`[Router] Error: ${error}`);
+
+      // 降级到 general
+      const generalIntent: IntentType = "general";
+      return {
+        routeResult: {
+          routeType: "general" as RouteType,
+          isCompound: false,
+          intents: [{ type: generalIntent }],
+          routingTime: Date.now() - startTime,
+        },
+        activeAgent: "general" as RouteType,
+      };
+    }
+  }
+
+  /**
+   * Router 条件路由
+   *
+   * 复合任务：路由到 compoundExecutor 节点，由其内部并行执行各 Agent
+   * 单一任务：直接路由到对应的 Agent 节点
+   */
+  private routeFromRouter(state: GraphState): string {
+    const routeResult = state.routeResult;
+
+    if (!routeResult) {
+      return "generalAgent";
+    }
+
+    // 复合任务：路由到 compoundExecutor 进行并行处理
+    if (routeResult.isCompound && routeResult.intents.length > 1) {
+      this.logger.info(
+        `[Router] Compound task detected with ${routeResult.intents.length} intents: ` +
+          `[${routeResult.intents.map((i) => i.type).join(", ")}], ` +
+          `routing to compoundExecutor`,
+      );
+      return "compoundExecutor";
+    }
+
+    // 单一任务
+    const agentNode = this.getAgentNodeName(routeResult.routeType);
+    this.logger.info(`[Router] Single task, routing to: ${agentNode}`);
+    return agentNode;
+  }
+
+  /**
+   * 获取 Agent 节点名称
+   */
+  private getAgentNodeName(routeType: RouteType): string {
+    switch (routeType) {
+      case "home_control":
+        return "homeControlAgent";
+      case "vision":
+        return "visionAgent";
+      case "ptz":
+        return "ptzAgent";
+      case "general":
+      default:
+        return "generalAgent";
+    }
+  }
+
+  // ========== Home Control Agent ==========
+
+  /**
+   * Home Control Agent 节点
+   */
+  private async homeControlAgent(
+    state: GraphState,
+    config: LangGraphRunnableConfig,
+  ) {
+    const startTime = Date.now();
+
+    try {
+      this.logger.info(
+        `[HomeControlAgent] Processing for user ${state.userId}`,
+      );
+
+      // 构建上下文
+      const input: ContextBuildInput = {
+        userId: state.userId,
+        command: state.command,
+        language: state.language,
+        messages: state.homeMessages || state.messages,
+        conversationContext: state.conversationContext,
+        routeResult: state.routeResult?.ragRouteResult, // 传递 RAG 路由结果用于 Tool Gating
+      };
+
+      const agentContext: AgentContext =
+        await this.contextBuilderFactory.buildContext("home_control", input);
+
+      // 获取工具并绑定到 LLM
+      const tools =
+        agentContext.tools.length > 0
+          ? agentContext.tools
+          : await this.toolProvider.generateControlTools(state.userId);
+
+      const llmWithTools = this.llm.bindTools(tools);
+
+      // 构建消息
+      const messages = [
+        { role: "system", content: agentContext.systemPrompt },
+        ...(agentContext.messages || []).map((msg: BaseMessage) => ({
+          role: msg instanceof HumanMessage ? "user" : "assistant",
+          content: msg.content,
+        })),
+        { role: "user", content: state.command },
+      ];
+
+      // 调用 LLM：继承 callbacks 但去掉 node runId，且强制非阻塞 callbacks
+      const response = await llmWithTools
+        .withConfig(this.childRunConfig(config, "homeControlAgent-llm"))
+        .invoke(messages);
+
+      // 计算成本
+      this.logLlmCost(response, "homeControlAgent", state);
+
+      const llmProcessingTime = Date.now() - startTime;
+
+      // 解析工具调用
+      const toolCalls = this.parseToolCalls(response);
+
+      if (toolCalls.length > 0) {
+        this.logger.info(
+          `[HomeControlAgent] Generated ${toolCalls.length} tool calls in ${llmProcessingTime}ms`,
+        );
+
+        return {
+          toolCalls,
+          llmResponse: response.content as string,
+          agentContext,
+          // 只更新 homeMessages，避免重复添加到 messages
+          homeMessages: [new HumanMessage(state.command)],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      } else {
+        // 直接对话
+        this.logger.info(
+          `[HomeControlAgent] Conversational response in ${llmProcessingTime}ms`,
+        );
+
+        const userMessage = new HumanMessage(state.command);
+        const aiMessage = new AIMessage(response.content as string);
+
+        return {
+          toolCalls: [],
+          llmResponse: response.content as string,
+          agentContext,
+          // 只更新 homeMessages，避免重复添加到 messages
+          homeMessages: [userMessage, aiMessage],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      }
+    } catch (error) {
+      this.logger.error(`[HomeControlAgent] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  /**
+   * Home Control Agent 条件路由
+   */
+  private routeFromHomeControl(state: GraphState): string[] {
+    const toolCalls = state.toolCalls || [];
+
+    if (toolCalls.length === 0) {
+      return ["generateResponse"];
+    }
+
+    const routes = new Set<string>();
+    for (const toolCall of toolCalls) {
+      const nodeName = getNodeForTool(toolCall.toolName);
+      if (nodeName) {
+        routes.add(nodeName);
+      } else {
+        this.logger.warn(
+          `[HomeControlAgent] Unknown tool: ${toolCall.toolName}`,
+        );
+      }
+    }
+
+    // 兜底：如果没有任何工具能映射到节点，避免返回空数组导致 Graph 中断
+    return routes.size > 0 ? Array.from(routes) : ["generateResponse"];
+  }
+
+  // ========== Vision Agent ==========
+
+  /**
+   * Vision Agent 节点
+   */
+  private async visionAgent(
+    state: GraphState,
+    config: LangGraphRunnableConfig,
+  ) {
+    const startTime = Date.now();
+
+    try {
+      this.logger.info(`[VisionAgent] Processing for user ${state.userId}`);
+
+      // 构建上下文
+      const input: ContextBuildInput = {
+        userId: state.userId,
+        command: state.command,
+        language: state.language,
+        messages: state.visionMessages || state.messages,
+        conversationContext: state.conversationContext,
+        routeResult: state.routeResult?.ragRouteResult, // 传递 RAG 路由结果用于 Tool Gating
+      };
+
+      const agentContext: AgentContext =
+        await this.contextBuilderFactory.buildContext("vision", input);
+
+      // 获取工具
+      const tools =
+        agentContext.tools.length > 0
+          ? agentContext.tools
+          : await this.cameraToolProvider.generateCameraTools(
+              state.userId,
+              toPrismaLanguage(state.language),
+            );
+
+      const llmWithTools = this.llm.bindTools(tools);
+
+      // 构建消息
+      const messages = [
+        { role: "system", content: agentContext.systemPrompt },
+        ...(agentContext.messages || []).map((msg: BaseMessage) => ({
+          role: msg instanceof HumanMessage ? "user" : "assistant",
+          content: msg.content,
+        })),
+        { role: "user", content: state.command },
+      ];
+
+      // 调用 LLM：继承 callbacks 但去掉 node runId，且强制非阻塞 callbacks
+      const response = await llmWithTools
+        .withConfig(this.childRunConfig(config, "visionAgent-llm"))
+        .invoke(messages);
+
+      this.logLlmCost(response, "visionAgent", state);
+
+      const llmProcessingTime = Date.now() - startTime;
+
+      // 解析工具调用
+      const toolCalls = this.parseToolCalls(response);
+
+      // 获取 Vision 子路由类型
+      const visionRouteType = agentContext.contextData?.visionRouteType;
+
+      if (toolCalls.length > 0) {
+        this.logger.info(
+          `[VisionAgent] Generated ${toolCalls.length} tool calls in ${llmProcessingTime}ms, visionRoute: ${visionRouteType}`,
+        );
+
+        return {
+          toolCalls,
+          llmResponse: response.content as string,
+          agentContext,
+          visionRouteType,
+          // 只更新 visionMessages，避免重复添加到 messages
+          visionMessages: [new HumanMessage(state.command)],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      } else {
+        this.logger.info(
+          `[VisionAgent] Conversational response in ${llmProcessingTime}ms`,
+        );
+
+        const userMessage = new HumanMessage(state.command);
+        const aiMessage = new AIMessage(response.content as string);
+
+        return {
+          toolCalls: [],
+          llmResponse: response.content as string,
+          agentContext,
+          visionRouteType,
+          // 只更新 visionMessages，避免重复添加到 messages
+          visionMessages: [userMessage, aiMessage],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      }
+    } catch (error) {
+      this.logger.error(`[VisionAgent] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  /**
+   * Vision Agent 条件路由
+   * 使用统一的 device-mappings 进行工具到节点的映射
+   */
+  private routeFromVision(state: GraphState): string[] {
+    const toolCalls = state.toolCalls || [];
+
+    if (toolCalls.length === 0) {
+      return ["generateResponse"];
+    }
+
+    const routes = new Set<string>();
+    for (const toolCall of toolCalls) {
+      // 使用统一的映射函数
+      const nodeName = getNodeForTool(toolCall.toolName);
+      if (nodeName) {
+        routes.add(nodeName);
+      } else {
+        // 兜底：处理可能的别名
+        // LLM 可能生成 camera_snapshot 而不是 get_camera_snapshot
+        const aliasMap: Record<string, string> = {
+          camera_snapshot: "cameraSnapshot",
+          list_cameras: "cameraList",
+          camera_list: "cameraList",
+        };
+        const aliasNode = aliasMap[toolCall.toolName];
+        if (aliasNode) {
+          routes.add(aliasNode);
+          this.logger.info(
+            `[VisionAgent] Tool alias mapped: ${toolCall.toolName} -> ${aliasNode}`,
+          );
+        } else {
+          this.logger.warn(`[VisionAgent] Unknown tool: ${toolCall.toolName}`);
+        }
+      }
+    }
+
+    return routes.size > 0 ? Array.from(routes) : ["generateResponse"];
+  }
+
+  private async ptzAgent(state: GraphState, config: LangGraphRunnableConfig) {
+    const startTime = Date.now();
+
+    try {
+      this.logger.info(`[PtzAgent] Processing for user ${state.userId}`);
+
+      const input: ContextBuildInput = {
+        userId: state.userId,
+        command: state.command,
+        language: state.language,
+        messages: state.ptzMessages || state.messages,
+        conversationContext: state.conversationContext,
+        routeResult: state.routeResult?.ragRouteResult,
+      };
+
+      const agentContext: AgentContext =
+        await this.contextBuilderFactory.buildContext("ptz", input);
+
+      const tools =
+        agentContext.tools.length > 0
+          ? agentContext.tools
+          : await this.ptzToolProvider.generatePtzTools(
+              state.userId,
+              toPrismaLanguage(state.language),
+            );
+
+      const llmWithTools = this.llm.bindTools(tools);
+
+      const messages = [
+        { role: "system", content: agentContext.systemPrompt },
+        ...(agentContext.messages || []).map((msg: BaseMessage) => ({
+          role: msg instanceof HumanMessage ? "user" : "assistant",
+          content: msg.content,
+        })),
+        { role: "user", content: state.command },
+      ];
+
+      const response = await llmWithTools
+        .withConfig(this.childRunConfig(config, "ptzAgent-llm"))
+        .invoke(messages);
+
+      this.logLlmCost(response, "ptzAgent", state);
+
+      const llmProcessingTime = Date.now() - startTime;
+      const toolCalls = this.parseToolCalls(response);
+
+      if (toolCalls.length > 0) {
+        return {
+          toolCalls,
+          llmResponse: response.content as string,
+          agentContext,
+          ptzMessages: [new HumanMessage(state.command)],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      }
+
+      const userMessage = new HumanMessage(state.command);
+      const aiMessage = new AIMessage(response.content as string);
+
+      return {
+        toolCalls: [],
+        llmResponse: response.content as string,
+        agentContext,
+        ptzMessages: [userMessage, aiMessage],
+        executionMetadata: {
+          ...state.executionMetadata,
+          llmProcessingTime,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[PtzAgent] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  private routeFromPtz(state: GraphState): string[] {
+    const toolCalls = state.toolCalls || [];
+
+    if (toolCalls.length === 0) {
+      return ["generateResponse"];
+    }
+
+    const routes = new Set<string>();
+    for (const toolCall of toolCalls) {
+      const nodeName = getNodeForTool(toolCall.toolName);
+      if (nodeName) {
+        routes.add(nodeName);
+      } else {
+        this.logger.warn(`[PtzAgent] Unknown tool: ${toolCall.toolName}`);
+      }
+    }
+
+    return routes.size > 0 ? Array.from(routes) : ["generateResponse"];
+  }
+
+  // ========== General Agent ==========
+
+  /**
+   * General Agent 节点
+   */
+  private async generalAgent(
+    state: GraphState,
+    config: LangGraphRunnableConfig,
+  ) {
+    const startTime = Date.now();
+
+    try {
+      this.logger.info(`[GeneralAgent] Processing for user ${state.userId}`);
+
+      // Fast-path：打招呼/寒暄直接本地回复，避免一次 LLM 调用
+      if (isTrivialGreeting(state.command)) {
+        const responseText = getTrivialGreetingResponse(state.language);
+        const llmProcessingTime = Date.now() - startTime;
+
+        this.logger.info(
+          `[GeneralAgent] Fast-path greeting in ${llmProcessingTime}ms`,
+        );
+
+        const userMessage = new HumanMessage(state.command);
+        const aiMessage = new AIMessage(responseText);
+
+        return {
+          llmResponse: responseText,
+          messages: [userMessage, aiMessage],
+          executionMetadata: {
+            ...state.executionMetadata,
+            llmProcessingTime,
+          },
+        };
+      }
+
+      // 构建上下文
+      const input: ContextBuildInput = {
+        userId: state.userId,
+        command: state.command,
+        language: state.language,
+        messages: state.messages,
+        conversationContext: state.conversationContext,
+        routeResult: state.routeResult?.ragRouteResult, // 传递 RAG 路由结果
+      };
+
+      const agentContext: AgentContext =
+        await this.contextBuilderFactory.buildContext("general", input);
+
+      // 构建消息（General Agent 不需要工具）
+      const messages = [
+        { role: "system", content: agentContext.systemPrompt },
+        ...(agentContext.messages || []).map((msg: BaseMessage) => ({
+          role: msg instanceof HumanMessage ? "user" : "assistant",
+          content: msg.content,
+        })),
+        { role: "user", content: state.command },
+      ];
+
+      // 调用 LLM：避免直接透传 node config（尤其是 runId），用 withConfig 叠加 runName，确保 LangSmith 展示嵌套 ChatOpenAI
+      const response = await this.llm
+        .withConfig(this.childRunConfig(config, "generalAgent-llm"))
+        .invoke(messages);
+
+      this.logLlmCost(response, "generalAgent", state);
+
+      const llmProcessingTime = Date.now() - startTime;
+
+      this.logger.info(`[GeneralAgent] Completed in ${llmProcessingTime}ms`);
+
+      const userMessage = new HumanMessage(state.command);
+      const aiMessage = new AIMessage(response.content as string);
+
+      return {
+        llmResponse: response.content as string,
+        agentContext,
+        messages: [userMessage, aiMessage],
+        executionMetadata: {
+          ...state.executionMetadata,
+          llmProcessingTime,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[GeneralAgent] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  // ========== 工具执行节点 ==========
+
+  private async controlLight(state: GraphState) {
+    return this.executeToolCalls(state, "control_home_light");
+  }
+
+  private async controlCurtain(state: GraphState) {
+    return this.executeToolCalls(state, "control_home_curtain");
+  }
+
+  private async controlAircon(state: GraphState) {
+    return this.executeToolCalls(state, "control_home_aircon_station");
+  }
+
+  private async controlUniSwitch(state: GraphState) {
+    return this.executeToolCalls(state, "control_home_uni_switch");
+  }
+
+  private async controlFloorHeating(state: GraphState) {
+    // Floor heating has two tools: control_home_floor_heating and control_home_simple_floor_heating
+    // Execute both and merge results
+    const results1 = await this.executeToolCalls(
+      state,
+      "control_home_floor_heating",
+    );
+    const results2 = await this.executeToolCalls(
+      state,
+      "control_home_simple_floor_heating",
+    );
+
+    return {
+      toolResults: [
+        ...(results1.toolResults || []),
+        ...(results2.toolResults || []),
+      ],
+    };
+  }
+
+  private async controlScene(state: GraphState) {
+    return this.executeToolCalls(state, "control_home_scene");
+  }
+
+  private async buildScene(state: GraphState) {
+    return this.executeToolCalls(state, "build_home_scene");
+  }
+
+  private async musicPlay(state: GraphState) {
+    return this.executeToolCalls(state, "music_play");
+  }
+
+  private async musicControl(state: GraphState) {
+    return this.executeToolCalls(state, "music_control");
+  }
+
+  private async cameraSnapshot(state: GraphState) {
+    return this.executeToolCalls(state, "get_camera_snapshot");
+  }
+
+  private async cameraList(state: GraphState) {
+    return this.executeToolCalls(state, "list_cameras");
+  }
+
+  private async ptzGetCapabilities(state: GraphState) {
+    return this.executeToolCalls(state, "ptz_get_capabilities");
+  }
+
+  private async ptzGetStatus(state: GraphState) {
+    return this.executeToolCalls(state, "ptz_get_status");
+  }
+
+  /**
+   * 通用工具执行
+   */
+  private async executeToolCalls(state: GraphState, toolName: string) {
+    try {
+      const toolCalls = state.toolCalls.filter(
+        (tc) => tc.toolName === toolName,
+      );
+      this.logger.info(`Executing ${toolCalls.length} ${toolName} tool calls`);
+
+      const results: ToolResult[] = [];
+
+      for (const toolCall of toolCalls) {
+        const startTime = Date.now();
+
+        const result: ToolResult = {
+          toolCallId: toolCall.id,
+          toolName: toolCall.toolName,
+          success: false,
+          result: undefined,
+          error: undefined,
+        };
+
+        try {
+          const params = toolCall.parameters;
+          if (!params || typeof params !== "object" || Array.isArray(params)) {
+            result.success = false;
+            result.error = "Invalid parameters";
+            this.logger.error(
+              `Invalid parameters for ${toolName}: ${JSON.stringify(params)}`,
+            );
+          } else {
+            // 根据工具名选择工具提供者
+            let tools: StructuredToolInterface[];
+            if (
+              toolName.startsWith("camera") ||
+              toolName === "get_camera_snapshot" ||
+              toolName === "list_cameras"
+            ) {
+              tools = await this.cameraToolProvider.generateCameraTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else if (toolName.startsWith("ptz_")) {
+              tools = await this.ptzToolProvider.generatePtzTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else {
+              tools = await this.toolProvider.generateControlTools(
+                state.userId,
+              );
+            }
+
+            const tool = tools.find(
+              (t: StructuredToolInterface) => t.name === toolName,
+            );
+
+            if (tool) {
+              const toolResult = await tool.invoke(params);
+              result.result = toolResult;
+
+              // 解析工具返回的 JSON 来检查实际执行结果
+              try {
+                const parsed =
+                  typeof toolResult === "string"
+                    ? JSON.parse(toolResult)
+                    : toolResult;
+                if (parsed && typeof parsed.success === "boolean") {
+                  result.success = parsed.success;
+                  if (!parsed.success) {
+                    // 使用工具返回的错误信息
+                    result.error =
+                      parsed.message || parsed.error || "Tool execution failed";
+                  }
+                } else if (typeof parsed === "string") {
+                  // 工具返回的是字符串消息，检查是否包含错误关键词
+                  // 注意: "No ... found" 需要分开匹配，因为中间可能有其他单词
+                  const errorPatterns =
+                    /\b(no|not|cannot|can't|couldn't)\b.*\b(found|available|supported)\b|failed|error|not supported|不支持|失败|找不到|无法|没有找到|不存在|没有.*设备|没有.*播放器/i;
+                  if (errorPatterns.test(parsed)) {
+                    result.success = false;
+                    result.error = parsed;
+                  } else {
+                    result.success = true;
+                  }
+                } else {
+                  // 对象但没有 success 字段，假设成功
+                  result.success = true;
+                }
+              } catch {
+                // 解析失败，检查原始字符串
+                const errorPatterns =
+                  /\b(no|not|cannot|can't|couldn't)\b.*\b(found|available|supported)\b|failed|error|not supported|不支持|失败|找不到|无法|没有找到|不存在|没有.*设备|没有.*播放器/i;
+                if (
+                  typeof toolResult === "string" &&
+                  errorPatterns.test(toolResult)
+                ) {
+                  result.success = false;
+                  result.error = toolResult;
+                } else {
+                  result.success = true;
+                }
+              }
+            } else {
+              result.success = false;
+              result.error = `${toolName} tool not found`;
+            }
+          }
+        } catch (error: any) {
+          result.success = false;
+          result.error = error?.message || `${toolName} execution failed`;
+          this.logger.error(`Error in ${toolName}: ${error?.message}`);
+        }
+
+        result.executionTime = Date.now() - startTime;
+        results.push(result);
+      }
+
+      return {
+        toolResults: results,
+      };
+    } catch (error) {
+      this.logger.error(`Error in ${toolName}: ${error}`);
+      return { error };
+    }
+  }
+
+  // ========== 结果处理节点 ==========
+
+  /**
+   * 汇总工具执行结果
+   */
+  private async aggregateResults(state: GraphState) {
+    try {
+      this.logger.info(
+        `[AggregateResults] Processing for user ${state.userId}`,
+      );
+
+      const toolResults = state.toolResults || [];
+      const successfulResults = toolResults.filter((r) => r.success === true);
+      const failedResults = toolResults.filter((r) => r.success === false);
+
+      // 从工具调用和用户命令中提取上下文信息
+      const updatedContext = this.extractContextFromResults(
+        state,
+        successfulResults,
+      );
+
+      // 根据语言生成结果描述
+      const isMandarin = state.language === ChatbotSupportedLanguage.MANDARIN;
+      let finalResponse = "";
+      if (failedResults.length > 0) {
+        const failedDetails = failedResults
+          .map((r) => `${r.toolName}: ${r.error}`)
+          .join(", ");
+        finalResponse = isMandarin
+          ? `部分操作执行失败: ${failedDetails}`
+          : `Some tools failed to execute: ${failedDetails}.`;
+      } else if (successfulResults.length === 0) {
+        finalResponse = isMandarin
+          ? "没有执行任何操作。"
+          : "No tools were executed.";
+      } else {
+        finalResponse = isMandarin
+          ? "所有操作执行成功。"
+          : "All tools executed successfully.";
+      }
+
+      // 如果是复合任务，记录 Agent 执行结果
+      if (state.routeResult?.isCompound) {
+        const agentResult: AgentExecutionResult = {
+          agentName: state.activeAgent || "unknown",
+          response: state.llmResponse || "",
+          toolCalls: state.toolCalls,
+          toolResults: toolResults,
+          executionTime:
+            state.executionMetadata?.llmProcessingTime ||
+            toolResults.reduce((sum, r) => sum + (r.executionTime || 0), 0),
+          success: failedResults.length === 0,
+          error:
+            failedResults.length > 0
+              ? failedResults.map((r) => r.error).join(", ")
+              : undefined,
+        };
+
+        return {
+          agentResults: [agentResult],
+          llmResponse: finalResponse,
+          conversationContext: updatedContext,
+          executionMetadata: {
+            ...state.executionMetadata,
+            totalToolsExecuted: toolResults.length,
+            parallelExecutionTime: toolResults.reduce(
+              (sum, r) => sum + (r.executionTime || 0),
+              0,
+            ),
+          },
+        };
+      }
+
+      return {
+        llmResponse: finalResponse,
+        conversationContext: updatedContext,
+        executionMetadata: {
+          ...state.executionMetadata,
+          totalToolsExecuted: toolResults.length,
+          parallelExecutionTime: toolResults.reduce(
+            (sum, r) => sum + (r.executionTime || 0),
+            0,
+          ),
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[AggregateResults] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  /**
+   * 从工具执行结果中提取上下文信息
+   * 用于更新 ConversationContext，支持后续的指代消解
+   */
+  private extractContextFromResults(
+    state: GraphState,
+    successfulResults: ToolResult[],
+  ): ConversationContext {
+    const currentContext = state.conversationContext || {};
+    const updatedContext: ConversationContext = { ...currentContext };
+
+    // 1. 从用户命令中提取位置
+    const locationFromCommand = extractLocation(state.command);
+    if (locationFromCommand) {
+      updatedContext.lastLocation = locationFromCommand;
+    }
+
+    // 2. 从工具调用参数中提取信息
+    const toolCalls = state.toolCalls || [];
+    for (const toolCall of toolCalls) {
+      const params = toolCall.parameters || {};
+
+      // 提取位置信息（location / room / area）
+      const locationParam = params.location || params.room || params.area;
+      if (locationParam && typeof locationParam === "string") {
+        updatedContext.lastLocation = locationParam;
+      }
+
+      // 提取设备类型
+      const intentType = getIntentForTool(toolCall.toolName);
+      if (intentType && intentType !== "unknown") {
+        updatedContext.lastDeviceType = intentType;
+      }
+
+      // 提取设备/目标名称
+      const targetName =
+        params.device_name || params.camera_name || params.scene_name;
+      if (targetName && typeof targetName === "string") {
+        updatedContext.lastTargetName = targetName;
+      }
+    }
+
+    // 3. 从成功的工具结果中提取额外信息
+    for (const result of successfulResults) {
+      // 从摄像头快照结果提取摄像头名称
+      if (result.toolName === "get_camera_snapshot" && result.result) {
+        try {
+          const resultData =
+            typeof result.result === "string"
+              ? JSON.parse(result.result)
+              : result.result;
+          if (resultData.cameraName) {
+            updatedContext.lastTargetName = resultData.cameraName;
+          }
+        } catch {
+          // 解析失败，忽略
+        }
+      }
+    }
+
+    this.logger.debug(
+      `[AggregateResults] Updated context: location=${updatedContext.lastLocation}, ` +
+        `deviceType=${updatedContext.lastDeviceType}, targetName=${updatedContext.lastTargetName}`,
+    );
+
+    // 更新时间戳
+    return updateContextTimestamp(updatedContext);
+  }
+
+  /**
+   * 复合任务执行器
+   *
+   * 并行执行各 Agent 的完整流程：
+   * 1. 为每个意图构建 ContextBuildInput
+   * 2. 调用 Agent 的 buildContext（内部执行 RAG、Tool Gating、阈值检查等）
+   * 3. 调用 LLM 生成工具调用
+   * 4. 执行工具
+   * 5. 收集结果
+   */
+  private async compoundExecutor(
+    state: GraphState,
+    config: LangGraphRunnableConfig,
+  ) {
+    const startTime = Date.now();
+
+    try {
+      const intents = state.routeResult?.intents || [];
+      this.logger.info(
+        `[CompoundExecutor] Processing ${intents.length} intents in parallel: ` +
+          `[${intents.map((i) => i.type).join(", ")}]`,
+      );
+
+      // 为每个意图构建并行执行任务
+      const agentTasks = intents.map(async (intent, index) => {
+        const intentStartTime = Date.now();
+        const routeType = mapIntentToRouteType(intent.type);
+        const agentName = this.getAgentNodeName(routeType);
+
+        this.logger.info(
+          `[CompoundExecutor] Starting agent task ${index + 1}/${intents.length}: ` +
+            `intent=${intent.type}, agent=${agentName}`,
+        );
+
+        try {
+          // Step 1: 确定该 Agent 处理的命令
+          // 复合任务：应当总是使用 Router 拆分出的 subCommand
+          const agentCommand = intent.subCommand || state.command;
+
+          if (!intent.subCommand) {
+            this.logger.warn(
+              `[CompoundExecutor] Missing subCommand for intent=${intent.type}, falling back to full command`,
+            );
+          }
+
+          this.logger.info(
+            `[CompoundExecutor] Agent ${agentName} using ${intent.subCommand ? "subCommand" : "full command"}: "${agentCommand}"`,
+          );
+
+          // Step 2: 构建 ContextBuildInput
+          const input: ContextBuildInput = {
+            userId: state.userId,
+            command: agentCommand, // 使用子命令或整句命令
+            language: state.language,
+            messages:
+              routeType === "home_control"
+                ? state.homeMessages || state.messages
+                : routeType === "vision"
+                  ? state.visionMessages || state.messages
+                  : routeType === "ptz"
+                    ? state.ptzMessages || state.messages
+                    : state.messages,
+            conversationContext: state.conversationContext,
+            routeResult: intent.ragRouteResult,
+          };
+
+          // Step 3: 调用对应 ContextBuilder 的 buildContext
+          // 这里会执行完整的 RAG、Tool Gating、阈值检查等流程
+          const agentContext: AgentContext =
+            await this.contextBuilderFactory.buildContext(routeType, input);
+
+          // Step 4: 获取工具并绑定到 LLM
+          let tools = agentContext.tools;
+          if (tools.length === 0) {
+            // 降级获取工具
+            if (routeType === "vision") {
+              tools = await this.cameraToolProvider.generateCameraTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else if (routeType === "ptz") {
+              tools = await this.ptzToolProvider.generatePtzTools(
+                state.userId,
+                toPrismaLanguage(state.language),
+              );
+            } else if (routeType === "home_control") {
+              tools = await this.toolProvider.generateControlTools(
+                state.userId,
+              );
+            }
+          }
+
+          const llmWithTools =
+            tools.length > 0 ? this.llm.bindTools(tools) : this.llm;
+
+          // Step 5: 构建消息（使用 agentCommand 而不是整句）
+          const messages = [
+            { role: "system", content: agentContext.systemPrompt },
+            ...(agentContext.messages || []).map((msg: BaseMessage) => ({
+              role: msg instanceof HumanMessage ? "user" : "assistant",
+              content: msg.content,
+            })),
+            { role: "user", content: agentCommand },
+          ];
+
+          // Step 7: 调用 LLM
+          const response = await llmWithTools
+            .withConfig(
+              this.childRunConfig(config, `compoundExecutor-${agentName}-llm`),
+            )
+            .invoke(messages);
+          this.logLlmCost(response, `compoundExecutor-${agentName}`, state);
+
+          // Step 8: 解析工具调用
+          const toolCalls = this.parseToolCalls(response);
+
+          // Step 9: 执行工具调用（带允许列表校验）
+          // v2.3: 从 agentContext.tools 提取允许的工具名，防止 LLM 幻觉
+          const allowedToolNames = tools.map((t) => t.name);
+          const toolResults: ToolResult[] = [];
+          if (toolCalls.length > 0) {
+            for (const toolCall of toolCalls) {
+              const toolStartTime = Date.now();
+              const result = await this.executeSingleToolCall(
+                toolCall,
+                state.userId,
+                state.language,
+                allowedToolNames,
+              );
+              result.executionTime = Date.now() - toolStartTime;
+              toolResults.push(result);
+            }
+          }
+
+          const executionTime = Date.now() - intentStartTime;
+          const successCount = toolResults.filter((r) => r.success).length;
+          const failCount = toolResults.filter((r) => !r.success).length;
+
+          this.logger.info(
+            `[CompoundExecutor] Agent ${agentName} completed in ${executionTime}ms: ` +
+              `toolCalls=${toolCalls.length}, success=${successCount}, fail=${failCount}`,
+          );
+
+          // Step 10: 如果有工具调用，生成基于工具结果的响应
+          let agentResponse = (response.content as string) || "";
+          if (toolCalls.length > 0) {
+            // 检查是否有摄像头快照结果
+            let hasImageContent = false;
+            const imageMessages: any[] = [];
+            const toolResultSummaries: string[] = [];
+
+            for (const r of toolResults) {
+              if (r.success) {
+                if (r.toolName === "get_camera_snapshot" && r.result) {
+                  const imagePayload =
+                    this.chatbotService.parseToolImagePayload(r.result);
+                  if (imagePayload && imagePayload.langchainContent) {
+                    hasImageContent = true;
+                    imageMessages.push(...imagePayload.langchainContent);
+                    toolResultSummaries.push(`${r.toolName}: 快照已获取`);
+                  } else {
+                    toolResultSummaries.push(`${r.toolName}: ${r.result}`);
+                  }
+                } else {
+                  toolResultSummaries.push(`${r.toolName}: ${r.result}`);
+                }
+              } else {
+                toolResultSummaries.push(`${r.toolName}: 失败 - ${r.error}`);
+              }
+            }
+
+            try {
+              let responseResult;
+
+              if (hasImageContent && imageMessages.length > 0) {
+                // 有图片：使用图片分析 prompt
+                const imagePrompt =
+                  state.language === ChatbotSupportedLanguage.MANDARIN
+                    ? `你是 Kon，一个具有视觉能力的智能家居助手。
+
+用户问：「${agentCommand}」
+
+你已收到摄像头快照。你必须：
+1. 仔细分析图片内容
+2. 详细描述你看到的内容
+3. 直接根据图片回答用户的问题
+4. 如果用户问关于人、动静、物品或特定情况，重点分析这些方面
+5. 具体、细致、有帮助
+
+不要只说"快照已获取"——你必须分析并描述实际的图片内容。`
+                    : `You are Kon, a smart home assistant with vision capabilities.
+
+The user asked: "${agentCommand}"
+
+You have received a camera snapshot. You MUST:
+1. CAREFULLY analyze the image content
+2. Describe what you see in detail
+3. DIRECTLY answer the user's question based on what you observe in the image
+4. If the user asks about people, movement, objects, or specific situations - focus your analysis on those aspects
+5. Be specific, observant and helpful
+
+Do NOT just say "snapshot captured" - you must analyze and describe the actual image content.`;
+
+                responseResult = await this.llm
+                  .withConfig(
+                    this.childRunConfig(
+                      config,
+                      `compoundExecutor-${agentName}-vision`,
+                    ),
+                  )
+                  .invoke([
+                    { role: "system", content: imagePrompt },
+                    {
+                      role: "user",
+                      content: [
+                        ...imageMessages,
+                        { type: "text", text: agentCommand },
+                      ],
+                    },
+                  ]);
+              } else {
+                // 无图片：使用普通 prompt
+                const responsePrompt =
+                  state.language === ChatbotSupportedLanguage.MANDARIN
+                    ? `你是一个智能家居助手。请根据以下工具执行结果，用中文生成简洁自然的响应：
+
+工具执行结果：
+${toolResultSummaries.join("\n")}
+
+用户原始请求：${agentCommand}
+
+要求：
+1. 简洁确认已完成的操作
+2. 如有失败的操作，简要说明
+3. 保持友好语气
+4. 不要提及设备 ID，使用自然语言描述`
+                    : `You are a smart home assistant. Generate a concise, natural response based on the following tool execution results:
+
+Tool execution results:
+${toolResultSummaries.join("\n")}
+
+User's original request: ${agentCommand}
+
+Requirements:
+1. Briefly confirm completed actions
+2. Mention any failures if they occurred
+3. Keep a friendly tone
+4. Do not mention device IDs, describe devices naturally`;
+
+                responseResult = await this.llm
+                  .withConfig(
+                    this.childRunConfig(
+                      config,
+                      `compoundExecutor-${agentName}-response`,
+                    ),
+                  )
+                  .invoke([
+                    { role: "system", content: responsePrompt },
+                    { role: "user", content: "请生成响应" },
+                  ]);
+              }
+
+              this.logLlmCost(
+                responseResult,
+                `compoundExecutor-${agentName}-response`,
+                state,
+              );
+              agentResponse =
+                (responseResult.content as string) || agentResponse;
+              this.logger.debug(
+                `[CompoundExecutor] Agent ${agentName} generated response: "${agentResponse.substring(0, 100)}..."`,
+              );
+            } catch (responseError: any) {
+              this.logger.warn(
+                `[CompoundExecutor] Agent ${agentName} failed to generate response: ${responseError?.message}`,
+              );
+            }
+          }
+
+          // 构建 AgentExecutionResult
+          const agentResult: AgentExecutionResult = {
+            agentName,
+            response: agentResponse,
+            toolCalls,
+            toolResults,
+            executionTime,
+            success: failCount === 0,
+            error:
+              failCount > 0
+                ? toolResults
+                    .filter((r) => !r.success)
+                    .map((r) => r.error)
+                    .join(", ")
+                : undefined,
+          };
+
+          return agentResult;
+        } catch (error: any) {
+          this.logger.error(
+            `[CompoundExecutor] Agent ${agentName} error: ${error?.message}`,
+          );
+
+          return {
+            agentName,
+            response: "",
+            toolCalls: [],
+            toolResults: [],
+            executionTime: Date.now() - intentStartTime,
+            success: false,
+            error: error?.message || "Unknown error",
+          } as AgentExecutionResult;
+        }
+      });
+
+      // 并行执行所有 Agent 任务
+      const agentResults = await Promise.all(agentTasks);
+
+      const totalTime = Date.now() - startTime;
+      this.logger.info(
+        `[CompoundExecutor] All agents completed in ${totalTime}ms, ` +
+          `results: ${agentResults.length}`,
+      );
+
+      // 收集所有工具结果（用于 conversationContext 更新）
+      const allToolResults: ToolResult[] = [];
+      const allToolCalls: ToolCall[] = [];
+      for (const result of agentResults) {
+        if (result.toolResults) {
+          allToolResults.push(...result.toolResults);
+        }
+        if (result.toolCalls) {
+          allToolCalls.push(...result.toolCalls);
+        }
+      }
+
+      return {
+        agentResults,
+        toolResults: allToolResults,
+        toolCalls: allToolCalls,
+        executionMetadata: {
+          ...state.executionMetadata,
+          parallelExecutionTime: totalTime,
+          totalToolsExecuted: allToolResults.length,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[CompoundExecutor] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  /**
+   * 执行单个工具调用
+   * v2.3: 添加 allowedToolNames 参数用于二次校验，防止 LLM 幻觉工具名
+   */
+  private async executeSingleToolCall(
+    toolCall: ToolCall,
+    userId: string,
+    language: ChatbotSupportedLanguage,
+    allowedToolNames?: string[],
+  ): Promise<ToolResult> {
+    const result: ToolResult = {
+      toolCallId: toolCall.id,
+      toolName: toolCall.toolName,
+      success: false,
+      result: undefined,
+      error: undefined,
+    };
+
+    try {
+      // v2.3: 允许列表校验（防止 LLM 幻觉工具名）
+      if (
+        allowedToolNames &&
+        allowedToolNames.length > 0 &&
+        !allowedToolNames.includes(toolCall.toolName)
+      ) {
+        result.error = `Tool "${toolCall.toolName}" not in allowed list`;
+        this.logger.warn(
+          `[CompoundExecutor] Tool ${toolCall.toolName} rejected: not in allowedToolNames [${allowedToolNames.slice(0, 5).join(", ")}...]`,
+        );
+        return result;
+      }
+
+      const params = toolCall.parameters;
+      this.logger.info(
+        `[CompoundExecutor] Tool ${toolCall.toolName} params: ${JSON.stringify(params)}`,
+      );
+
+      if (!params || typeof params !== "object" || Array.isArray(params)) {
+        result.error = "Invalid parameters";
+        return result;
+      }
+
+      // 根据工具名选择工具提供者
+      let tools: StructuredToolInterface[];
+      const toolName = toolCall.toolName;
+      if (
+        toolName.startsWith("camera") ||
+        toolName === "get_camera_snapshot" ||
+        toolName === "list_cameras"
+      ) {
+        tools = await this.cameraToolProvider.generateCameraTools(
+          userId,
+          toPrismaLanguage(language),
+        );
+      } else if (toolName.startsWith("ptz_")) {
+        tools = await this.ptzToolProvider.generatePtzTools(
+          userId,
+          toPrismaLanguage(language),
+        );
+      } else {
+        tools = await this.toolProvider.generateControlTools(userId);
+      }
+
+      const tool = tools.find(
+        (t: StructuredToolInterface) => t.name === toolName,
+      );
+
+      if (tool) {
+        const toolResult = await tool.invoke(params);
+        result.result = toolResult;
+
+        // 解析工具返回的 JSON 来检查实际执行结果
+        try {
+          const parsed =
+            typeof toolResult === "string"
+              ? JSON.parse(toolResult)
+              : toolResult;
+          if (parsed && typeof parsed.success === "boolean") {
+            result.success = parsed.success;
+            if (!parsed.success) {
+              // 使用工具返回的错误信息
+              result.error =
+                parsed.message || parsed.error || "Tool execution failed";
+            }
+          } else if (typeof parsed === "string") {
+            // 工具返回的是字符串消息，检查是否包含错误关键词
+            const errorPatterns =
+              /not found|failed|error|not supported|不支持|失败|找不到|无法|没有找到|不存在/i;
+            if (errorPatterns.test(parsed)) {
+              result.success = false;
+              result.error = parsed;
+            } else {
+              result.success = true;
+            }
+          } else {
+            // 对象但没有 success 字段，假设成功
+            result.success = true;
+          }
+        } catch {
+          // 解析失败，检查原始字符串
+          const errorPatterns =
+            /not found|failed|error|not supported|不支持|失败|找不到|无法|没有找到|不存在/i;
+          if (
+            typeof toolResult === "string" &&
+            errorPatterns.test(toolResult)
+          ) {
+            result.success = false;
+            result.error = toolResult;
+          } else {
+            result.success = true;
+          }
+        }
+      } else {
+        result.success = false;
+        result.error = `${toolName} tool not found`;
+      }
+    } catch (error: any) {
+      result.success = false;
+      result.error = error?.message || "Tool execution failed";
+      this.logger.error(
+        `[CompoundExecutor] Tool ${toolCall.toolName} error: ${result.error}`,
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * 复合任务汇总器
+   * 负责：1. 合并各 Agent 响应 2. 更新 conversationContext
+   */
+  private async compoundAggregator(state: GraphState) {
+    try {
+      this.logger.info(`[CompoundAggregator] Merging agent results`);
+
+      const agentResults = state.agentResults || [];
+
+      // 合并各 Agent 的响应
+      const mergedResponse = this.mergeAgentResponses(
+        agentResults,
+        state.language,
+      );
+      this.logger.info(
+        `[CompoundAggregator] Merged response: "${mergedResponse.substring(0, 100)}..."`,
+      );
+
+      // 更新 conversationContext
+      const updatedContext = this.extractContextFromCompoundResults(
+        state,
+        agentResults,
+      );
+
+      return {
+        llmResponse: mergedResponse,
+        conversationContext: updatedContext,
+      };
+    } catch (error) {
+      this.logger.error(`[CompoundAggregator] Error: ${error}`);
+      return { error };
+    }
+  }
+
+  /**
+   * 合并多个 Agent 的响应
+   */
+  private mergeAgentResponses(
+    agentResults: AgentExecutionResult[],
+    language: ChatbotSupportedLanguage,
+  ): string {
+    const responses: string[] = [];
+
+    for (const result of agentResults) {
+      this.logger.debug(
+        `[MergeResponses] Agent ${result.agentName}: response="${result.response?.substring(0, 100)}..."`,
+      );
+
+      // 跳过空响应
+      if (!result.response || result.response.trim() === "") {
+        this.logger.debug(
+          `[MergeResponses] Agent ${result.agentName}: skipped (empty)`,
+        );
+        continue;
+      }
+
+      // 跳过默认/无效响应
+      const lowerResponse = result.response.toLowerCase();
+      if (
+        lowerResponse.includes("how can i assist") ||
+        lowerResponse.includes("hello!") ||
+        lowerResponse === "i understand your request." ||
+        result.response === "我理解了您的请求"
+      ) {
+        this.logger.debug(
+          `[MergeResponses] Agent ${result.agentName}: skipped (default response)`,
+        );
+        continue;
+      }
+
+      responses.push(result.response);
+    }
+
+    if (responses.length === 0) {
+      return language === ChatbotSupportedLanguage.MANDARIN
+        ? "操作已完成。"
+        : "Operation completed.";
+    }
+
+    // 如果只有一个响应，直接返回
+    if (responses.length === 1) {
+      return responses[0];
+    }
+
+    // 多个响应：用换行连接
+    return responses.join("\n\n");
+  }
+
+  /**
+   * 从复合任务结果中提取上下文信息
+   */
+  private extractContextFromCompoundResults(
+    state: GraphState,
+    agentResults: AgentExecutionResult[],
+  ): ConversationContext {
+    const currentContext = state.conversationContext || {};
+    const updatedContext: ConversationContext = { ...currentContext };
+
+    // 从用户命令中提取位置
+    const locationFromCommand = extractLocation(state.command);
+    if (locationFromCommand) {
+      updatedContext.lastLocation = locationFromCommand;
+    }
+
+    // 从各 Agent 的工具调用中提取信息
+    for (const agentResult of agentResults) {
+      const toolCalls = agentResult.toolCalls || [];
+      for (const toolCall of toolCalls) {
+        const params = toolCall.parameters || {};
+
+        // 提取位置信息
+        const locationParam = params.location || params.room || params.area;
+        if (locationParam && typeof locationParam === "string") {
+          updatedContext.lastLocation = locationParam;
+        }
+
+        // 提取设备类型
+        const intentType = getIntentForTool(toolCall.toolName);
+        if (intentType && intentType !== "unknown") {
+          updatedContext.lastDeviceType = intentType;
+        }
+      }
+    }
+
+    // 更新时间戳
+    return updateContextTimestamp(updatedContext);
+  }
+
+  /**
+   * 生成最终响应
+   */
+  private async generateResponse(state: GraphState) {
+    try {
+      this.logger.info("[GenerateResponse] Generating final response");
+      this.logger.info(
+        `generateResponse state llmResponse: ${JSON.stringify(state.llmResponse)}`,
+      );
+
+      // 错误处理
+      if (state.error) {
+        const errorResponse =
+          state.language === ChatbotSupportedLanguage.ENGLISH
+            ? "I'm sorry, there was an error processing your request."
+            : "抱歉，处理您的请求时出现了错误";
+
+        const audio =
+          await this.chatbotService.synthesizeSpeechOpenAI(errorResponse);
+
+        return {
+          finalResponse: errorResponse,
+          audio,
+          // 清空工具调用相关状态，准备下一轮对话
+          toolCalls: [],
+          toolResults: [],
+        };
+      }
+
+      // 获取和清理final response
+      let finalResponse =
+        state.llmResponse ||
+        (state.language === ChatbotSupportedLanguage.ENGLISH
+          ? "I understand your request."
+          : "我理解了您的请求");
+
+      // 复合任务：已在 compoundAggregator 中合并响应，直接使用
+      // 单任务：如果有工具结果，生成智能响应
+      const toolResults = state.toolResults || [];
+      const isCompoundTask =
+        state.routeResult?.isCompound &&
+        state.agentResults &&
+        state.agentResults.length > 0;
+
+      if (!isCompoundTask && toolResults.length > 0) {
+        // 单任务有工具结果：生成智能响应
+        finalResponse = await this.generateIntelligentResponse(state);
+      }
+      // 复合任务：llmResponse 已由 compoundAggregator 合并各 Agent 响应
+
+      // 检查是否为JSON格式（避免用户看到技术细节）
+      if (this.isJsonResponse(finalResponse)) {
+        this.logger.warn(
+          "Detected JSON response in llmResponse, using fallback",
+        );
+        this.logger.debug(
+          `Original response (first 200 chars): ${finalResponse.substring(0, 200)}`,
+        );
+        finalResponse =
+          state.language === ChatbotSupportedLanguage.ENGLISH
+            ? "I understand your request and I'm working on it."
+            : "我理解了您的请求，正在为您处理。";
+      }
+
+      const audio =
+        await this.chatbotService.synthesizeSpeechOpenAI(finalResponse);
+
+      // Finalize token usage for this request
+      if (state.sessionId) {
+        try {
+          const { priceCalculator } = await import("../tools/price");
+          priceCalculator.finalizeRequestTokens(state.sessionId);
+        } catch (error) {
+          this.logger.warn(`Failed to finalize request tokens: ${error}`);
+        }
+      }
+
+      // 添加 AI 消息到历史
+      const aiMessage = new AIMessage(finalResponse);
+
+      return {
+        finalResponse,
+        audio,
+        messages: [aiMessage],
+        // 清空工具调用相关状态，准备下一轮对话
+        toolCalls: [],
+        toolResults: [],
+      };
+    } catch (error) {
+      this.logger.error(`[GenerateResponse] Error: ${error}`);
+
+      const errorResponse =
+        state.language === ChatbotSupportedLanguage.ENGLISH
+          ? "I'm sorry, there was an error processing your request."
+          : "抱歉，处理您的请求时出现了错误";
+
+      const audio =
+        await this.chatbotService.synthesizeSpeechOpenAI(errorResponse);
+
+      return {
+        error,
+        finalResponse: errorResponse,
+        audio,
+        // 清空工具调用相关状态，准备下一轮对话
+        toolCalls: [],
+        toolResults: [],
+      };
+    }
+  }
+
+  /**
+   * 生成智能响应（基于工具执行结果）
+   */
+  private async generateIntelligentResponse(
+    state: GraphState,
+  ): Promise<string> {
+    try {
+      this.logger.info(
+        `Generating intelligent response for user ${state.userId}`,
+      );
+
+      const toolResults = state.toolResults || [];
+      const successfulResults = toolResults.filter((r) => r.success === true);
+      const failedResults = toolResults.filter((r) => r.success === false);
+      const isMandarin = state.language === ChatbotSupportedLanguage.MANDARIN;
+
+      // 检查是否有摄像头快照（需要图片分析）
+      let hasImageContent = false;
+      const processedMessages: any[] = [];
+
+      for (const result of successfulResults) {
+        if (result.toolName === "get_camera_snapshot" && result.result) {
+          const imagePayload = this.chatbotService.parseToolImagePayload(
+            result.result,
+          );
+          if (imagePayload && imagePayload.langchainContent) {
+            hasImageContent = true;
+            processedMessages.push(...imagePayload.langchainContent);
+          }
+        }
+      }
+
+      // 快速路径：无需调用 LLM，直接生成响应
+      if (!hasImageContent && toolResults.length > 0) {
+        // 判断工具类型
+        const queryResults = toolResults.filter(
+          (r) => this.getToolActionType(r.toolName, r.result) === "query",
+        );
+        const controlResults = toolResults.filter(
+          (r) => this.getToolActionType(r.toolName, r.result) === "control",
+        );
+
+        // 纯查询类：提取 message 直接返回
+        if (queryResults.length > 0 && controlResults.length === 0) {
+          const successfulQueries = queryResults.filter((r) => r.success);
+          if (successfulQueries.length > 0) {
+            const messages = successfulQueries
+              .map((r) => this.extractReadableMessage(r.result))
+              .filter((msg): msg is string => msg !== null && msg.length > 0);
+            if (messages.length > 0) {
+              return messages.join("\n");
+            }
+          }
+          // 查询失败
+          if (failedResults.length > 0) {
+            const rawError = failedResults[0]?.error || "Unknown error";
+            const humanError = this.humanizeErrorMessage(rawError, isMandarin);
+            return isMandarin
+              ? `抱歉，${humanError}`
+              : `Sorry, ${humanError.toLowerCase()}`;
+          }
+        }
+
+        // 控制类或混合类：使用模板响应
+        if (failedResults.length === 0) {
+          // 全部成功
+          return isMandarin ? "好的，已完成。" : "Done.";
+        } else if (successfulResults.length === 0) {
+          // 全部失败 - 转换为人类友好消息
+          const rawError = failedResults[0]?.error || "Unknown error";
+          const humanError = this.humanizeErrorMessage(rawError, isMandarin);
+          return isMandarin
+            ? `抱歉，${humanError}`
+            : `Sorry, ${humanError.toLowerCase()}`;
+        } else {
+          // 部分成功
+          return isMandarin
+            ? `已完成 ${successfulResults.length} 个操作，${failedResults.length} 个失败。`
+            : `Completed ${successfulResults.length}, ${failedResults.length} failed.`;
+        }
+      }
+
+      // 没有工具执行，使用 LLM 回复
+      if (toolResults.length === 0) {
+        const systemContent = `You are Kon, a smart home assistant. Respond briefly.${isMandarin ? " 用中文回复。" : ""}`;
+        const response = await this.llm.invoke(
+          [
+            { role: "system", content: systemContent },
+            { role: "user", content: state.command },
+          ],
+          { runName: "generateIntelligentResponse-noTools" },
+        );
+        this.logLlmCost(response, "generateIntelligentResponse-noTools", state);
+        return response.content as string;
+      }
+
+      // 有图片：需要调用 LLM 分析
+      const systemContent = `You are Kon with vision. Analyze the image and answer: "${state.command}"${isMandarin ? " 用中文回复。" : ""}`;
+      const messages: Array<{ role: string; content: string | any[] }> = [
+        { role: "system", content: systemContent },
+        { role: "user", content: processedMessages },
+      ];
+
+      const response = await this.llm.invoke(messages, {
+        runName: "generateIntelligentResponse-vision",
+      });
+      this.logLlmCost(response, "generateIntelligentResponse-vision", state);
+      return response.content as string;
+    } catch (error) {
+      this.logger.error(`Error in generateIntelligentResponse: ${error}`);
+      return state.language === ChatbotSupportedLanguage.MANDARIN
+        ? "已完成。"
+        : "Done.";
+    }
+  }
+
+  // ========== 辅助方法 ==========
+
+  /**
+   * 解析工具调用
+   * v2.3: 增强健壮性，处理 args 为字符串的情况
+   */
+  private parseToolCalls(response: any): ToolCall[] {
+    const toolCalls: ToolCall[] = [];
+
+    if (response.tool_calls && response.tool_calls.length > 0) {
+      for (const toolCall of response.tool_calls) {
+        let parameters: Record<string, any> = {};
+
+        // 处理 args 可能是字符串的情况
+        if (toolCall.args) {
+          if (typeof toolCall.args === "string") {
+            // 尝试 JSON 解析
+            try {
+              parameters = JSON.parse(toolCall.args);
+              this.logger.info(
+                `[ToolCall] Parsed string args for ${toolCall.name}`,
+              );
+            } catch (parseError) {
+              // 解析失败，记录并置空
+              this.logger.warn(
+                `[ToolCall] Failed to parse string args for ${toolCall.name}: ${parseError}. ` +
+                  `Raw args: "${toolCall.args.slice(0, 100)}..."`,
+              );
+              parameters = {};
+            }
+          } else if (typeof toolCall.args === "object") {
+            parameters = toolCall.args;
+          } else {
+            this.logger.warn(
+              `[ToolCall] Unexpected args type for ${toolCall.name}: ${typeof toolCall.args}`,
+            );
+          }
+        }
+
+        toolCalls.push({
+          id: toolCall.id || uuidv4(),
+          toolName: toolCall.name,
+          parameters,
+        });
+        this.logger.info(
+          `[ToolCall] ${toolCall.name} args: ${JSON.stringify(parameters)}`,
+        );
+      }
+    }
+
+    return toolCalls;
+  }
+
+  /**
+   * 记录 LLM 成本
+   */
+  private logLlmCost(response: any, nodeName: string, state: GraphState) {
+    try {
+      const usage = calculateLlmCost(
+        response,
+        this.modelName,
+        "standard",
+        state.userId,
+        state.sessionId,
+        state.sessionId,
+        undefined,
+        state.command,
+      );
+      this.logger.info(
+        `💰 [${nodeName}] Cost: $${usage.cost}, Tokens: ${usage.input_tokens}+${usage.output_tokens}`,
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to calculate LLM cost: ${error}`);
+    }
+  }
+
+  /**
+   * 检测是否为 JSON 响应
+   */
+  private isJsonResponse(response: string): boolean {
+    if (!response) return false;
+    const trimmed = response.trim();
+    return (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    );
+  }
+
+  /**
+   * 已知查询类工具白名单
+   */
+  private static readonly QUERY_TOOLS = new Set([
+    "get_camera_snapshot",
+    "list_cameras",
+    "ptz_get_capabilities",
+    "ptz_get_status",
+    "get_device_status",
+    "query_device_state",
+    "count_devices",
+    "check_device",
+  ]);
+
+  /**
+   * 判断工具动作类型
+   * 优先级：1. 解析 result.action 2. 白名单 3. toolName 模式
+   */
+  private getToolActionType(
+    toolName: string,
+    result?: any,
+  ): "control" | "query" {
+    // 1. 尝试从 toolResult 解析 action 字段
+    if (result) {
+      try {
+        const parsed =
+          typeof result === "string" ? JSON.parse(result) : result;
+        if (parsed?.action === "query" || parsed?.type === "query") {
+          return "query";
+        }
+        if (parsed?.action === "control" || parsed?.type === "control") {
+          return "control";
+        }
+      } catch {
+        // 解析失败，继续其他判断
+      }
+    }
+
+    // 2. 白名单匹配
+    if (MultiAgentGraph.QUERY_TOOLS.has(toolName)) {
+      return "query";
+    }
+
+    // 3. toolName 模式匹配（兜底）
+    if (/^(get_|list_|query_|count_|check_)/.test(toolName)) {
+      return "query";
+    }
+
+    return "control";
+  }
+
+  /**
+   * 将技术错误消息转换为用户友好消息
+   */
+  private humanizeErrorMessage(
+    error: string,
+    isMandarin: boolean,
+  ): string {
+    const errorLower = error.toLowerCase();
+
+    // 设备未找到
+    if (errorLower.includes("not found")) {
+      if (errorLower.includes("aircon") || errorLower.includes("空调")) {
+        return isMandarin ? "找不到该空调设备" : "Air conditioner not found";
+      }
+      if (errorLower.includes("light") || errorLower.includes("灯")) {
+        return isMandarin ? "找不到该灯" : "Light not found";
+      }
+      if (errorLower.includes("curtain") || errorLower.includes("窗帘")) {
+        return isMandarin ? "找不到该窗帘" : "Curtain not found";
+      }
+      if (errorLower.includes("scene") || errorLower.includes("场景")) {
+        return isMandarin ? "找不到该场景" : "Scene not found";
+      }
+      return isMandarin ? "找不到该设备" : "Device not found";
+    }
+
+    // 操作失败
+    if (
+      errorLower.includes("failed") ||
+      errorLower.includes("error") ||
+      errorLower.includes("失败")
+    ) {
+      if (errorLower.includes("control")) {
+        return isMandarin ? "设备控制失败" : "Device control failed";
+      }
+      return isMandarin ? "操作失败，请稍后重试" : "Operation failed, please try again";
+    }
+
+    // 不支持
+    if (errorLower.includes("not supported") || errorLower.includes("不支持")) {
+      return isMandarin ? "该操作不支持" : "This operation is not supported";
+    }
+
+    // 连接错误
+    if (
+      errorLower.includes("connect") ||
+      errorLower.includes("timeout") ||
+      errorLower.includes("network")
+    ) {
+      return isMandarin ? "设备连接失败" : "Device connection failed";
+    }
+
+    // 默认：如果消息较短且看起来像人话，直接返回
+    if (error.length < 50 && !/[A-Z]{2,}|_|\d{3,}/.test(error)) {
+      return error;
+    }
+
+    // 兜底
+    return isMandarin ? "操作失败" : "Operation failed";
+  }
+
+  /**
+   * 从工具结果提取人类可读消息
+   * 确保返回纯文本，不返回 JSON
+   */
+  private extractReadableMessage(result: any): string | null {
+    if (!result) return null;
+
+    try {
+      const parsed = typeof result === "string" ? JSON.parse(result) : result;
+
+      // 优先提取 message/summary 字段
+      if (typeof parsed === "object") {
+        if (parsed.message && typeof parsed.message === "string") {
+          return parsed.message;
+        }
+        if (parsed.summary && typeof parsed.summary === "string") {
+          return parsed.summary;
+        }
+        // 如果有 data 但没有 message，不直接返回 data（避免 JSON）
+        return null;
+      }
+
+      // 纯字符串直接返回（如果不是 JSON 格式）
+      if (typeof parsed === "string" && !this.isJsonResponse(parsed)) {
+        return parsed;
+      }
+
+      return null;
+    } catch {
+      // 解析失败，检查原始字符串
+      if (typeof result === "string" && !this.isJsonResponse(result)) {
+        return result;
+      }
+      return null;
+    }
+  }
+
+  /**
+   * 执行 Graph
+   */
+  async invoke(input: Partial<GraphState>, config?: any): Promise<GraphState> {
+    this.logger.info("[MultiAgentGraph] Invoking");
+
+    const configWithTimeout = {
+      ...config,
+      timeout: 60000,
+    };
+
+    return await this.graph.invoke(input, configWithTimeout);
+  }
+}
