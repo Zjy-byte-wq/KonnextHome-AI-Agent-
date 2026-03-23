@@ -1,0 +1,112 @@
+一、实现功能
+
+①意图识别
+
+用户发送指令到 routerAgent
+
+routerAgent 使用 ChatOpenAI LLM 将指令分类为三类：
+
+home_control 家居控制
+
+vision_analysis 视觉分析
+
+general_chat 日常对话
+
+输出 intent 字段作为下一步路由依据
+
+LLM 解析失败时提供关键字匹配兜底
+
+②智能路由
+
+routeFromRouter 根据 intent 跳转到不同 Agent：
+
+homePlanning：执行家居控制任务
+
+visionPlanning：执行视觉分析任务
+
+其他情况直接生成对话响应
+
+③多 Agent 协作
+
+每个 Agent 专注于特定任务，系统可同时处理家居控制、视觉分析和日常对话，实现任务分发和模块化管理
+
+
+二、详细开发步骤
+新增 Router Node
+
+文件：/opt/konnext-home/src/integrations/chatbot/langgraph/graph.ts
+
+操作：
+
+在 buildGraph() 前插入一个 RouterAgent 节点，作为 prepareContext → Router → 对应 Agent 的入口
+
+Router 根据指令关键词判断走哪条路（家居 / 视觉）
+
+定义家居 Agent
+
+文件：/opt/konnext-home/src/integrations/chatbot/langgraph/homeControlAgent.ts（新建）
+
+操作：
+
+继承旧的 planningAgent 逻辑
+
+绑定家居相关工具（灯光、空调、窗帘、地暖、场景、音乐等）
+
+内存隔离：独立 MemorySaver 实例
+
+定义视觉 Agent
+
+文件：/opt/konnext-home/src/integrations/chatbot/langgraph/visionAgent.ts（新建）
+
+操作：
+
+专属 Prompt，指示 LLM 关注视觉信息（门口是谁、摄像头快照等）
+
+绑定视觉工具（摄像头快照、识别、拼图等）
+
+独立 MemorySaver
+
+修改工具调用聚合
+
+文件：/opt/konnext-home/src/integrations/chatbot/langgraph/graph.ts
+
+操作：
+
+aggregateResults 支持不同 Agent 工具的结果
+
+可以在返回时标注工具属于哪个 Agent，便于 debug
+
+生成响应
+
+文件：/opt/konnext-home/src/integrations/chatbot/langgraph/graph.ts
+
+操作：
+
+generateIntelligentResponse 根据 Agent 返回的工具结果生成自然语言
+
+Router Node 可以在最终生成响应前合并或区分不同 Agent 的结果
+
+路由逻辑示例
+
+文件：graph.ts 或单独 routerAgent.ts
+
+内容：
+
+function routeByCommand(command: string) {
+  if (/空调|灯|窗帘|地暖/.test(command)) return 'HomeControlAgent';
+  if (/监控|门口|摄像头/.test(command)) return 'VisionAgent';
+  return 'generateResponse';
+}
+
+
+测试与验证
+
+输入不同类型指令，确认：
+
+家居指令走 HomeControlAgent
+
+视觉指令走 VisionAgent
+
+Agent 内存互不干扰
+
+工具调用正确执行，最终生成自然语言响应
