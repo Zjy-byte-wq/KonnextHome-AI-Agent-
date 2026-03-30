@@ -1,0 +1,262 @@
+最小跑通架构：
+如果你的验收口径是上次我们收敛出的“最小跑通”目标，这张优化图里的紫色 Optimized PTZ Branch 基本满足要求。
+如果你的验收口径还是最初那版“完整优化目标”，那它还差 2 个点，没有完全闭环。
+
+这张图已经满足的点
+
+路由前置位置是对的。
+紫色分支放在 isTrivialGreeting? 之后、detectExplicitCompound(command) 之前，这正好解决当前最大问题：帮我、然后、, 会在 compound 预处理阶段把 PTZ 整句提前拆掉。
+
+强制 PTZ 的出口形态是对的。
+图里直接返回：
+
+routeType = ptz
+isCompound = false
+intents = [ptz]
+这和你的目标完全一致，能保证“扫描 + 找目标 + 给图”整体进入 ptzAgent。
+
+原 compound 主链路被保留了。
+isPtzForceRoute(command)? = N 时仍然回到原来的 CommandPreprocessor -> Compound Command，这符合“只覆盖纯 PTZ 域，不影响普通 camera / home_control / general”的要求。
+
+最小图片闭环方向是对的。
+从图上看，紫色 PTZ 工具节点已经不是 find_target_tool -> capture_frame_tool 串联，而是让 ptzFindTarget 自己返回 best_image_url + image payload。
+这比“先 find 再 capture”更适合最小跑通，也更稳，因为不需要 graph 再做一次依赖中间结果的二次 tool call。
+
+结果层也补上了图片路径。
+如果你图中紫色 generateResponse 的含义确实是“capture_frame_tool / find_target_tool 都按图片结果处理”，那这就满足“返回垃圾桶画面并给出描述”的最小目标了。
+
+这张优化图对“最小跑通版本”是合理的，主链路已经对了：
+
+Router
+→ isTrivialGreeting?
+→ isPtzForceRoute?
+→ 直接 single:ptz
+→ ptzAgent
+→ find_target_tool 返回图片payload
+→ generateResponse 基于图片生成描述
+
+这个链路已经能覆盖你当前最关心的问题。
+
+最小跑通落地方案：
+
+**目标定义**
+
+这版“最小跑通”只解决一个核心闭环：
+
+- 输入：`扫描云台所有预置位帮我找一下是否有垃圾桶如果存在给我图片`
+- 输出：
+  - 整句被路由到 `ptzAgent`
+  - 不再被拆成 `ptz + general`
+  - 找到目标时返回图片并给一句描述
+
+这版先不追求：
+
+- 全量 channel 透传
+- 用户显式 channel 覆盖所有 PTZ 动作
+- RAG / Router 全面一致性修复
+- 全局 compound 规则重写
+
+---
+
+**一、最小改动范围**
+
+只改 4 个位置。
+
+1. 路由前置强约束  
+文件：[context-builder.factory.ts](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts)
+
+2. PTZ Agent 最小执行规则  
+文件：[ptz-context.builder.ts](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts)
+
+3. `find_target_tool` 图片闭环  
+文件：[ptz-camera.tool.provider.ts](/opt/ai/src/chatbot/tools/ptz-camera.tool.provider.ts)
+
+4. 结果层把 `find_target_tool` 视为图片工具  
+文件：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+---
+
+**二、逐项落地方案**
+
+**1. 路由前置层**
+位置：[context-builder.factory.ts](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts)
+
+边界：
+- 只在 `route()` 最前面加一个 PTZ 强约束判断
+- 放在 `isTrivialGreeting` 之后、`detectExplicitCompound()` 之前
+- 不改 [command-preprocessor.ts](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts)
+
+更改内容简述：
+- 新增一组纯函数，建议放在 `ContextBuilderFactory` 内部：
+  - `detectPtzTrigger(command)`
+  - `isPurePtzWorkflow(command)`
+  - `shouldForceRouteToPtz(command)`
+- 最小 trigger 词：
+  - `云台`
+  - `ptz`
+- 最小 workflow 词：
+  - `扫描`
+  - `预置位`
+  - `巡检`
+  - `找`
+  - `截图`
+  - `抓图`
+  - `识别`
+  - `分析`
+- 最小 block 词：
+  - `灯`
+  - `窗帘`
+  - `空调`
+  - `音乐`
+  - `场景`
+  - `门口摄像头`
+  - `前院摄像头`
+  - `列出摄像头`
+- 命中后直接返回：
+  - `routeType: "ptz"`
+  - `isCompound: false`
+  - `intents: [{ type: "ptz", subCommand: command }]`
+
+目的：
+- 绕过当前 `帮我/然后/,` 被 compound 预处理提前拆句的问题
+- 只对纯 PTZ 域命令生效，不影响普通 camera/home_control/general
+
+---
+
+**2. PTZ Context 最小补强**
+位置：[ptz-context.builder.ts](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts)
+
+边界：
+- 只补 prompt 规则
+- 不做 metadata 结构扩展
+- 不做 channel 优先级体系
+
+更改内容简述：
+- 在 PTZ system prompt 里补 2 条最小规则：
+  - 当用户表达“扫描预置位 + 找目标”时，优先调用 `find_target_tool`
+  - 当用户表达“如果找到给我图片/截图”时，如果工具结果里已有图片，直接基于该图片回复
+- 默认 channel 先按现有实现处理，不在这一版引入显式 `defaultChannelId` 注入
+
+目的：
+- 让 `ptzAgent` 在单次任务里更稳定地选中 `find_target_tool`
+- 不把“给图”再错误交给 general/vision
+
+---
+
+**3. 工具层闭环放到 `find_target_tool` 本身**
+位置：[ptz-camera.tool.provider.ts](/opt/ai/src/chatbot/tools/ptz-camera.tool.provider.ts)
+
+边界：
+- 不新增新工具
+- 不做 `find_target_tool -> capture_frame_tool` 的 graph 级串联
+- 不扩到全量 channel 重构
+
+更改内容简述：
+- 修改 `runFindTargetTool()` 的返回结构
+- 一旦命中目标，除现有字段外，补充：
+  - `best_image_url`
+  - `openaiContent`
+  - `langchainContent`
+- 图片来源直接复用扫描过程中命中的那张 `url`
+- 不再依赖后续额外抓拍
+
+目的：
+- 让 `find_target_tool` 自己成为“找目标 + 带图返回”的完整工具
+- 避免 graph 二次调用 `capture_frame_tool` 时拿不到 `best_preset` 或拍错画面
+
+说明：
+- 这是“最小跑通”里最关键的一步
+- 你的业务目标是“找到垃圾桶则给图”，最短路径不是多工具编排，而是直接增强 `find_target_tool` 的结果
+
+---
+
+**4. 结果层识别 `find_target_tool` 图片结果**
+位置：[multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)
+
+边界：
+- 只改图片工具识别白名单
+- 不改 graph 节点拓扑
+- 不改 compoundExecutor 主逻辑
+
+更改内容简述：
+- 把 `find_target_tool` 加入 `IMAGE_TOOLS`
+- 保持现有 `generateIntelligentResponse()` 逻辑复用图片 payload 分析输出
+
+目的：
+- 让结果层把 `find_target_tool` 的返回当成图片结果处理
+- 最终回复里自然包含：
+  - 图片
+  - 对图片的简短描述
+  - 是否发现垃圾桶
+
+---
+
+**三、明确不改的边界**
+
+这版先不改以下位置：
+
+- [command-preprocessor.ts](/opt/ai/src/chatbot/preprocessor/command-preprocessor.ts)  
+原因：避免影响全局 compound 行为
+
+- [router-context.builder.ts](/opt/ai/src/chatbot/context-builder/router-context.builder.ts)  
+原因：这版主问题不在 Router LLM
+
+- [knowledge.service.ts](/opt/ai/src/chatbot/knowledge_base/knowledge.service.ts)  
+原因：前置 short-circuit 已足够解决当前 case
+
+- PTZ 全量 channel 设计  
+原因：当前 `move_to_preset / zoom / find_target` 仍有硬编码 `1`，完整支持 channel 覆盖不是“最小跑通”范围
+
+---
+
+**四、最小验收标准**
+
+正向样例：
+
+- `扫描云台所有预置位帮我找一下垃圾桶并截图给我`
+- `扫描ptz预置位找一下车并截图`
+- `扫描ptz所有预置位，然后截图给我`
+
+期望：
+- `routeType = "ptz"`
+- `isCompound = false`
+- `intents.length = 1`
+- 找到目标时最终回复带图片和描述
+
+反向保护样例：
+
+- `查看ptz状态，然后开客厅灯`
+- `扫描ptz所有预置位，然后关窗帘`
+- `看看门口摄像头，然后截图给我`
+
+期望：
+- 前两条仍保留 compound
+- 第三条仍走 vision/camera，不被 PTZ 强约束吞掉
+
+---
+
+**五、实施顺序**
+
+1. 先改 [context-builder.factory.ts](/opt/ai/src/chatbot/context-builder/context-builder.factory.ts)  
+目标：先把误拆问题解决
+
+2. 再改 [ptz-camera.tool.provider.ts](/opt/ai/src/chatbot/tools/ptz-camera.tool.provider.ts)  
+目标：让 `find_target_tool` 自己返回图片
+
+3. 再改 [multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts)  
+目标：结果层识别 `find_target_tool` 图片 payload
+
+4. 最后补 [ptz-context.builder.ts](/opt/ai/src/chatbot/context-builder/ptz-context.builder.ts)  
+目标：提高 `ptzAgent` 的工具选择稳定性
+
+---
+
+**六、一句话总结**
+
+最小跑通方案就是两件事：
+
+- 在路由入口加一个“纯 PTZ 命令强制不拆句”的 short-circuit
+- 让 `find_target_tool` 直接返回命中图片，并在结果层按图片工具处理
+
+如果你认可，我下一步可以把这份方案继续细化成“按文件的具体改动设计”，精确到每个文件新增什么函数、输入输出是什么、判断顺序怎么写。
+
