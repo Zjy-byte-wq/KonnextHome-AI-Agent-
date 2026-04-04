@@ -1,0 +1,114 @@
+### 问题2 ###
+我现在遇到了第二个问题，监控日志如图。用户指令“把云台摄像头移动到5号预置位然后放大5倍后给我画面截图，通道为1”，期望调用工具：move preset-->zoom--> capture frame tool，但实际结果显示只成功调用move preset，
+### 问题2 ###
+
+### 问题2 分析 ###
+问题仍然不在执行器，而在 ptzAgent-llm 的工具规划阶段。
+
+从这张 trace 看，已经可以确定：
+
+ptzToolExecutor 正常工作
+但它只拿到了一条 tool call：move_to_preset_tool(presetId=5)
+右侧 camera_zoom、capture_frame_tool 根本没有进入 toolCalls
+所以执行器只能串行执行这一步，不能“补全”后续动作
+也就是说，当前失败链路是：
+
+用户指令 -> ptzAgent-llm 只规划了 move_to_preset_tool -> ptzToolExecutor 按计划执行
+
+不是：
+
+规划了三步 -> 执行器漏执行后两步
+
+为什么会这样
+当前 prompt 虽然已经补了：
+
+zoom + capture
+move + capture
+find_target + zoom + capture
+但还没有把你这个更复杂的三段链路写成硬规则或示例：
+
+move_to_preset_tool -> camera_zoom -> capture_frame_tool
+
+你这句：
+把云台摄像头移动到5号预置位然后放大5倍后给我画面截图，通道为1
+
+对模型来说包含 3 个动作意图：
+
+移动到预置位
+放大 5 倍
+给我截图
+而现在的 prompt 对“二段链路”约束已经够强，但对“三段链路”还不够强，所以模型这轮只抓住了最前面的主动作 move_to_preset_tool。
+
+从你图里的右侧输入也能印证这一点：
+只有
+
+{"presetId":5}
+没有 level: 5，也没有 channelId: "1"。
+
+根因
+这是 LLM 规划遗漏，不是工具执行缺陷。
+
+更具体地说，是两个缺口叠加：
+
+Prompt 缺少 “move + zoom + capture” 的强规则和示例
+你现在只有两段链路规则，没有把三段链路写死。
+
+程序层没有“缺步修复”
+ptzToolExecutor 只负责按顺序执行，不负责根据用户语义补齐漏掉的 zoom / capture。
+
+为什么之前“放大后截图”能成功
+因为那是二段链路：
+camera_zoom -> capture_frame_tool
+
+这个模式已经被你前面补强过，模型更容易稳定命中。
+
+而“移动到预置位后再放大再截图”是更长链路，当前 prompt 覆盖不够。
+
+结论
+这是“多步工具规划覆盖不足”的问题，属于同一类系统性问题的第二层：
+
+第一层你已经修掉了：执行并发
+第二层现在暴露出来了：规划漏步
+
+
+
+
+
+
+
+ ### 解决方案###  --- prompt规则约束 + 程序兜底
+
+
+建议修法
+要同时做两件事。
+
+继续补 prompt
+在 ptz-context.builder.ts 里再加硬规则：
+If the user asks to move to a preset, then zoom, then provide a screenshot, you MUST call move_to_preset_tool, then camera_zoom, then capture_frame_tool
+If both preset movement and zoom are requested before a screenshot, do not omit any intermediate PTZ action
+并加示例：
+
+把云台摄像头移动到5号预置位然后放大5倍后给我画面截图，通道为1 -> move_to_preset_tool(presetId=5), camera_zoom(level=5), capture_frame_tool(channelId="1")
+把云台摄像头移动到5号预置位然后缩小5倍后给我画面截图，通道为1 -> move_to_preset_tool(presetId=5), camera_zoom(level=-5), capture_frame_tool(channelId="1")
+加程序侧兜底修复
+这是更关键的。
+在 ptzAgent 解析完 toolCalls 后，增加一个 normalizePtzToolCalls(...)：
+
+如果用户文本包含“预置位”
+且包含“放大/缩小/缩放”
+且包含“截图/抓图/画面/快照”
+但 LLM 只给了 move_to_preset_tool
+那就自动补：
+
+camera_zoom
+capture_frame_tool
+同理：
+
+只有 move_to_preset_tool 且用户要截图 -> 自动补 capture_frame_tool
+只有 camera_zoom 且用户要截图 -> 自动补 capture_frame_tool
+move + capture 但用户还明确要缩放 -> 在中间补 camera_zoom
+一句话
+你这次失败的直接原因是：ptzAgent-llm 只生成了 move_to_preset_tool，没有生成 camera_zoom 和 capture_frame_tool；而当前执行器不会自动补全缺失步骤。
+
+如果你要，我下一步可以直接把这两个修复都改进去：
+先补 prompt，再在代码里加 normalizePtzToolCalls() 的兜底逻辑。

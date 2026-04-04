@@ -1,0 +1,300 @@
+### 问题3 ###
+当用户指令：扫描云台所有预置位找到墙体，然后放大五倍后给我画面截图，但是只有find_target_tool被成功调用，如果我想实现预置位巡检后zoom功能，应该把zoom这个工具写到find_target_tool中还是应该链式调用find_target_tool和zoom？
+### 问题3 ###
+
+
+### 问题分析 ###
+当前
+find target tool内部并发：find_target_tool 内部流程是：先串行遍历 preset；每个 preset 上先 moveToPreset，再 captureFrameToCloud；然后把图像分析任务提交到一个受 max_workers 限制的并发池。
+但是如果要先找到“目标”后缩放就不能把zoom写到find_target_tool中因为截图上传云端已经先执行了。
+如果把zoom放在find_target_tool之外，也不能实现先缩放后截图的逻辑
+
+-->所以一定要改find_target_tool本身
+
+当前问题
+
+find_target_tool 现在的核心问题不是“能不能找到目标”，而是“找到之后，设备状态不可靠”。
+
+它的当前流程是：
+
+串行遍历预置位
+每个预置位先 moveToPreset
+再 captureFrameToCloud
+然后把图像分析提交到受 max_workers 限制的并发池
+这会带来 3 个实际问题。
+
+返回时摄像头位置不确定
+因为“发现目标”的判断发生在异步分析阶段，而主循环可能已经继续移动到后续预置位。
+所以即使结果说 bestPreset=3，函数结束时摄像头未必还停在 3。
+
+后续链式 PTZ 动作不安全
+如果后面再接：
+camera_zoom -> capture_frame_tool
+这些动作可能作用在错误的当前视角上，而不是目标所在预置位。
+
+工具结果和设备真实状态可能不一致
+find_target_tool 返回的数据说“在预置位 3 找到墙体”，但设备当前物理状态可能已经跑到了别的预置位。
+这会让 trace 看起来成功，但后续控制结果偏掉。
+
+
+问题本质：
+
+find_target_tool 现在同时承担了两件事：
+
+查找目标
+驱动 PTZ 到多个预置位巡检
+而“巡检阶段的设备状态”和“异步分析阶段的发现结果”没有在函数结束时重新对齐。
+
+也就是说，它缺少一个很重要的收尾步骤：
+
+“如果找到了目标，结束前把 PTZ 回到命中的 bestPreset”。
+
+
+当前结论
+
+find_target_tool 本身可以继续保留。
+但在现有实现下，不能安全假设：
+
+find_target_tool 结束后，摄像头一定已经停在目标所在预置位。
+
+所以你现在如果要支持：
+
+找到目标后放大
+找到目标后缩小
+找到目标后截图
+就必须先修这个状态一致性问题。
+
+### 解决方案 ###
+
+方案 1：修正 find_target_tool 结束状态
+这是必须先做的基础修复。
+
+在 find_target_tool 内部所有分析任务结束后，如果找到了 bestPreset，就在返回前显式执行：
+
+再次 moveToPreset(bestPreset)
+这样可以保证：
+
+工具返回时，摄像头确实停在命中的预置位
+后续 camera_zoom 和 capture_frame_tool 才有意义
+这是最关键的一步。
+
+方案 2：保持链式调用
+修完上面之后，推荐的调用链是：
+
+find_target_tool -> camera_zoom -> capture_frame_tool
+
+这样职责清晰：
+
+find_target_tool 负责找目标并定位到目标预置位
+camera_zoom 负责缩放
+capture_frame_tool 负责最终抓图
+这是当前最合理的设计。
+
+方案 3：不要把 zoom 硬塞进 find_target_tool
+不建议直接把 zoom 写进 find_target_tool，原因是：
+
+工具职责会混乱
+参数会快速膨胀
+后续还会想加 capture、analyze，最后变成超级工具
+trace 和故障定位会更差
+所以默认不推荐这么做。
+
+方案 4：高频场景再做组合工具
+如果你们业务里经常出现：
+
+“扫描预置位找到目标，然后放大/缩小并截图”
+
+那可以新增一个组合工具，例如：
+
+find_target_zoom_capture_tool
+内部完成：
+
+find target
+move back to best preset
+zoom
+capture
+注意这是“新增组合工具”，不是污染 find_target_tool。
+
+推荐落地顺序
+
+先修 find_target_tool
+保证返回前回到 bestPreset
+
+再继续用链式调用
+find_target_tool -> camera_zoom -> capture_frame_tool
+
+如果 LLM 规划还不稳定
+再加 prompt 强规则或程序兜底补链
+
+如果这是高频固定流程
+再考虑单独做组合工具
+
+一句话总结
+
+当前 find_target_tool 的核心问题是：
+它能找到目标，但不能保证返回时摄像头还停在目标所在预置位。
+所以在支持“找到目标后继续 zoom/capture”之前，必须先让它在结束前回到 bestPreset，然后再做链式调用。
+
+
+### 解决方案 step1 ####
+这次改动的作用是：
+
+保证 find_target_tool 返回时，PTZ 尽量停在命中的目标预置位
+后续如果你链 camera_zoom -> capture_frame_tool，它们作用的就是目标所在位置，而不是巡检过程中最后停留的其他预置位
+另外我加了两条日志/容错：
+
+成功进入回位时会打：
+[find_target_tool] Repositioning PTZ to bestPreset=... before returning
+如果回位失败，会把错误写进 details，并打 warn 日志
+你现在可以复测这类链路：
+
+扫描云台所有预置位找到墙体，然后放大五倍后给我画面截图
+预期下一步如果规划出了 find_target_tool -> camera_zoom -> capture_frame_tool，后两步就会在正确的命中预置位上执行。
+
+这次我只改了 find_target_tool 的状态收尾，没有继续动 prompt 或兜底补链逻辑。下一步如果你要继续，我建议就做“找到目标后放大并截图”的 prompt 补强或程序侧补链。
+
+
+### 解决方案 step2 ####
+
+下一步不要再只靠 prompt 了，直接上“程序侧补链”。
+
+**目标**
+解决这类多步 PTZ 指令的规划遗漏：
+
+- `find_target -> zoom -> capture`
+- `move -> zoom -> capture`
+- `zoom -> capture`
+- `move -> capture`
+
+也就是：即使 LLM 少产出一步或两步，系统也能在进入 `ptzToolExecutor` 之前自动补齐。
+
+---
+
+**推荐方案**
+在 `ptzAgent` 里，`parseToolCalls(response)` 之后增加一个：
+
+`normalizePtzToolCalls(command, toolCalls)`
+
+它做两类事：
+
+1. 识别用户意图
+从原始 `command` 中提取：
+- 是否要求找目标：`扫描 / 找到 / 查找 / 巡检 / 预置位`
+- 是否要求缩放：`放大 / 缩小 / 缩放`
+- 是否要求截图：`截图 / 抓图 / 快照 / 给我画面 / 给我图片`
+
+2. 补齐缺失工具
+根据 `command` 和当前 `toolCalls`，自动追加缺失步骤。
+
+---
+
+**补链规则**
+建议先实现这几条硬规则。
+
+1. 如果用户要求“找目标 + 缩放 + 截图”
+而 `toolCalls` 只有 `find_target_tool`
+就补：
+- `camera_zoom`
+- `capture_frame_tool`
+
+结果变成：
+`find_target_tool -> camera_zoom -> capture_frame_tool`
+
+2. 如果用户要求“找目标 + 截图”
+而 `toolCalls` 只有 `find_target_tool`
+就补：
+- `capture_frame_tool`
+
+3. 如果用户要求“移动预置位 + 缩放 + 截图”
+而 `toolCalls` 只有 `move_to_preset_tool`
+就补：
+- `camera_zoom`
+- `capture_frame_tool`
+
+4. 如果用户要求“缩放 + 截图”
+而 `toolCalls` 只有 `camera_zoom`
+就补：
+- `capture_frame_tool`
+
+5. 如果用户要求“移动预置位 + 截图”
+而 `toolCalls` 只有 `move_to_preset_tool`
+就补：
+- `capture_frame_tool`
+
+---
+
+**关键实现点**
+需要补两类参数：
+
+1. `camera_zoom.level`
+从用户文本中提取：
+- `放大5倍` -> `5`
+- `缩小5倍` -> `-5`
+- `放大五倍` -> `5`
+- `缩小十倍` -> `-10`
+
+2. `capture_frame_tool.channelId`
+从用户文本提取：
+- `通道为1`
+- `1号通道`
+- `channel 1`
+
+---
+
+**放在哪改**
+就在 [multi-agent-graph.ts](/opt/ai/src/chatbot/langgraph/multi-agent-graph.ts) 的 `ptzAgent()` 里：
+
+当前是：
+```ts
+const toolCalls = this.parseToolCalls(response);
+```
+
+改成类似：
+```ts
+const rawToolCalls = this.parseToolCalls(response);
+const toolCalls = this.normalizePtzToolCalls(state.command, rawToolCalls);
+```
+
+---
+
+**为什么这一步最重要**
+因为它能把系统从：
+
+“LLM 规划正确才成功”
+
+变成：
+
+“LLM 只要抓住主动作，系统也能补全标准 PTZ 链路”
+
+这对你现在的场景最关键。  
+PTZ 是物理设备控制，不能把链路完整性只交给模型概率输出。
+
+---
+
+**实施顺序**
+1. 先做 `normalizePtzToolCalls()`
+2. 先覆盖 5 条高频补链规则
+3. 给补链打日志：
+   - 原始 `toolCalls`
+   - 补链后的 `toolCalls`
+   - 补链原因
+4. 再用你现有测试集回归
+
+---
+
+**预期收益**
+改完后，即使 LLM 只产出：
+
+- `find_target_tool`
+- 或 `move_to_preset_tool`
+- 或 `camera_zoom`
+
+系统也能自动补成你真正想要的执行链。
+
+---
+
+**一句话方案**
+下一步最有效的方案是：  
+在 `ptzAgent` 里新增 `normalizePtzToolCalls(command, toolCalls)`，基于用户原始指令对 PTZ 多步链路做程序侧补齐，而不是继续单纯堆 prompt。
+
+如果你要，我下一步可以直接把这套补链逻辑实现出来。

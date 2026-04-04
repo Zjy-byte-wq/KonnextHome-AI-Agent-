@@ -1,0 +1,54 @@
+### 问题 ###
+
+现在的问题是当用户指令“缩小当前云台画面10倍并给我缩放后截图，通道为1”，trace如图所示，为什么没有成功调用抓图工具？但是如用户提问“放大当前云台画面5倍并给我放大后截图，通道为1”就能成功实现zoom, capture_frame调用链路？
+
+### 问题 ###
+
+### 问题分析 ###
+
+原因不是执行器漏跑了 capture_frame_tool，而是这一轮 ptzAgent-llm 根本只生成了一个 tool call：camera_zoom(level=-10)。
+
+从你的 trace 可以直接看出来：
+
+ptzToolExecutor 里只有一次执行
+绿色工具只有 camera_zoom
+没有 capture_frame_tool
+所以后面的串行执行器没有机会去抓图
+也就是说，问题发生在“工具规划阶段”，不是“工具执行阶段”。
+
+为什么“放大后截图”能成功，“缩小后截图”却失败
+当前 PTZ prompt 和工具描述里，虽然有：
+
+camera_zoom(level)，正值放大，负值缩小，见 ptz-camera.tool.provider.ts (line 138)
+capture_frame_tool({channelId?})，见 ptz-camera.tool.provider.ts (line 156)
+但没有一条强约束明确告诉模型：
+
+“只要用户说了 缩放后截图 / 放大后截图 / 缩小后截图，就必须规划成 camera_zoom + capture_frame_tool 两步。”
+
+现在的系统提示只写了“物理动作必须串行”，见 ptz-context.builder.ts (line 31)，但没写“哪些自然语言模式一定要补抓图”。
+
+所以模型在这两句话上的行为变成了概率性的：
+
+“放大后截图”更容易被理解成两步动作
+“缩小后截图”这轮被理解成“先执行缩小”，没有继续规划截图
+再加一个细节：缩小当前云台画面10倍并给我缩放后截图
+这句里“缩放后截图”比较泛，不像“放大后截图”那样和前面的动作词完全一致，模型更容易把后半句当成描述性补充，而不是明确的第二个工具动作。
+
+结论
+这是 LLM 工具规划不稳定，不是执行链路问题。
+
+修复方向
+要在 PTZ prompt 里把“缩放/移动后截图”写成硬规则，最好再加中英文少量示例。建议补这几条：
+
+如果用户要求“截图/抓图/快照/给我画面”，必须调用 capture_frame_tool
+如果用户要求“放大后截图”或“缩小后截图”，必须先 camera_zoom，再 capture_frame_tool
+如果用户要求“移动到预置位后截图”，必须先 move_to_preset_tool，再 capture_frame_tool
+缩小 等价于 camera_zoom(level<0)，但不影响后续仍需抓图
+如果你要，我可以直接把这个 prompt 规则补进代码，顺手加两三个 few-shot 示例，专门修正“缩小后截图”这类规划遗漏
+
+### 问题分析 ###
+
+
+
+
+

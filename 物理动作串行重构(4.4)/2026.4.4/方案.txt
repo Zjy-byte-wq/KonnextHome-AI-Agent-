@@ -1,0 +1,243 @@
+####### 测试结果 #########
+
+并发工具：
+find target tool内部并发：find_target_tool 内部流程是：先串行遍历 preset；每个 preset 上先 moveToPreset，再 captureFrameToCloud；然后把图像分析任务提交到一个受 max_workers 限制的并发池。
+
+工具非串行控制问题：
+用户指令（+通道为1）	预期结果	工具调用	实际结果
+把云台摄像头移动到7号预置位后截图给我	先移动到预置位7-->给出画面和描述	move to preset , capture frame	工具几乎同时启动
+放大当前云台画面5倍并给我缩放后截图	先放大-->给出放大后画面和描述	zoom , capture frame	工具几乎同时启动
+缩小当前云台画面5倍并给我缩放后截图	先缩小-->给出缩小后画面描述	zoom , capture frame	工具几乎同时启动
+把云台移动到5号预置位放大5倍后给我画面截图	先移动到预置位5-->放大五倍-->给出截图和描述	move to preset，zoom ，capture frame	工具几乎同时启动
+把云台移动到5号预置位缩小5倍后给我画面截图	先移动预置位到5-->缩小五倍-->给出截图和描述	move to preset，zoom ，capture frame	工具几乎同时启动
+扫描云台所有预置位找到红墙，然后放大五倍后截图给我	先移动到红墙所在预置位-->放大5倍-->给出截图和描述	find target tool ，zoom	工具几乎同时启动
+扫描云台所有预置位找到红墙，然后缩小五倍后截图给我	先移动到红墙所在预置位-->缩小5倍-->给出截图和描述	find target tool ，zoom	工具几乎同时启动
+
+-->说明：当前工具节点是被Langgraph并发调度的
+
+####### 现存问题的系统性分析 #########
+<1>现象理解：
+当前系统把“执行顺序约束”放在了 prompt 里，但没有放进执行引擎里。因此只要 LLM 在同一轮里产出多个 PTZ tool call，LangGraph 就会把这些工具节点并发放开，导致所有“先动云台、再缩放、再截图”这类链式动作失效。7 组测试都出现“工具几乎同时启动”，这不是偶发，而是同一个架构缺陷在不同指令上的重复表现。
+<2>根因分析：
+为什么说是系统性问题
+根因不在单个工具，而在调度层设计。
+
+ptzAgent 会一次性产出多个 tool calls
+见 multi-agent-graph.ts (line 640)。
+
+routeFromPtz 会把这些 tool call 映射成多个节点并一起返回
+见 multi-agent-graph.ts (line 682)。
+它返回的是 string[]，例如：
+["ptzMoveToPreset", "ptzZoom", "ptzCaptureFrame"]
+
+LangGraph 对 addConditionalEdges(...)-> string[] 的语义就是多分支并发
+图定义在 multi-agent-graph.ts (line 168)；
+各 PTZ 节点又都直接连到 aggregateResults，见 multi-agent-graph.ts (line 185)。
+
+你虽然在 prompt 里写了 “Physical actions must be serial”，但执行器没有遵守这个约束
+见 ptz-context.builder.ts (line 31)。
+
+所以问题本质是：
+语义层要求串行
+调度层默认并行
+运行时没有依赖管理
+
+更深一层的问题
+这还暴露出两个设计风险：
+
+顺序依赖靠 LLM 自觉，不可靠
+LLM 可以理解“先后”，但执行引擎没有 dependency model，结果仍会并发。
+
+工具节点粒度不对
+move_to_preset_tool、camera_zoom、capture_frame_tool 被拆成独立节点后，如果没有串行执行器，就天然容易被图引擎并发调度。
+
+
+########### 解决方案分析###########
+我建议的最终方案
+按优先级：
+
+先做方案 A
+把 PTZ 工具执行改成单执行节点顺序跑，立即修复线上行为。
+
+再做方案 B
+补执行策略元数据，把“串行/并行”从 prompt 约束升级成 runtime 约束。
+
+对高频复合意图补方案 C
+把最常见的 PTZ 多步操作做成组合工具，减少 LLM 自由编排。
+
+为什么不建议只改 prompt
+因为你已经验证了：prompt 明确写了“must be serial”，但系统仍并发。
+这说明问题不在理解层，而在执行层。继续调 prompt 只会让问题更隐蔽，不会真正消失。
+
+一句话根因
+当前架构把 PTZ 多步动作当成“多个可并发图节点”处理了，但 PTZ 实际上是“共享单一物理资源的状态机”，这两者模型不匹配。
+
+如果你要，我下一步可以直接给你一版可落地的改造方案：
+把 routeFromPtz 改成单节点 ptzToolExecutor，并给出需要修改的具体代码位置。
+
+
+
+################ 最终落地方案 #############
+把 PTZ 多步动作从“LLM 产出多个工具后由图并发调度”改成“同一条 PTZ 指令在一个串行执行器里按顺序执行”。
+
+这样才能保证：
+
+move -> capture
+zoom -> capture
+move -> zoom -> capture
+find_target -> zoom -> capture
+
+
+
+
+
+
+
+方案 1：单 PTZ 执行节点串行化
+这是我建议你优先落地的方案，最稳。
+
+改造思路
+新增一个节点：
+ptzToolExecutor
+
+职责：
+
+接收 state.toolCalls
+过滤出 PTZ 工具调用
+按原始顺序逐个执行
+汇总 toolResults
+再进入 aggregateResults
+图结构改造
+当前：
+
+ptzAgent -> ptzMoveToPreset
+ptzAgent -> ptzZoom
+ptzAgent -> ptzCaptureFrame
+ptzAgent -> ptzFindTarget
+并发触发
+改成：
+
+ptzAgent -> ptzToolExecutor -> aggregateResults
+具体修改点
+在图里增加节点
+文件：multi-agent-graph.ts (line 142)
+新增：
+
+.addNode("ptzToolExecutor", this.ptzToolExecutor.bind(this))
+修改 routeFromPtz()
+文件：multi-agent-graph.ts (line 682)
+现在返回多个节点，改为统一返回：
+
+return toolCalls.length > 0 ? ["ptzToolExecutor"] : ["generateResponse"];
+新增执行器方法
+复用你已有的 executeSingleToolCall(...)，见 multi-agent-graph.ts (line 1564)
+核心逻辑：
+
+private async ptzToolExecutor(state: GraphState) {
+  const toolCalls = state.toolCalls || [];
+  const results: ToolResult[] = [];
+
+  for (const toolCall of toolCalls) {
+    const start = Date.now();
+    const result = await this.executeSingleToolCall(
+      toolCall,
+      state.userId,
+      state.language,
+    );
+    result.executionTime = Date.now() - start;
+    results.push(result);
+  }
+
+  return { toolResults: results };
+}
+加边
+文件：multi-agent-graph.ts (line 187)
+新增：
+
+.addEdge("ptzToolExecutor", "aggregateResults")
+并删除或停用 PTZ 原子节点在单任务路径上的条件路由入口。
+
+方案 2：给 PTZ 工具加执行策略
+这是第二阶段，建议在方案 1 稳定后做。
+
+增加工具元数据
+给每个 PTZ tool 定义：
+
+executionMode: serial / parallel
+resourceKey: ptz:channel:1
+category: physical / query / vision
+requiresPreviousResult: boolean
+示例：
+
+move_to_preset_tool: serial, physical
+camera_zoom: serial, physical
+capture_frame_tool: serial, physical
+ptz_get_status: parallel, query
+ptz_get_capabilities: parallel, query
+analyze_image_tool: parallel, 但依赖 url
+find_target_tool: serial, physical, 独占资源
+好处
+以后不只是 PTZ，别的设备有类似问题也能统一处理。
+
+方案 3：把高频链式动作变成组合工具
+这是第三阶段，偏产品化。
+
+建议新增组合工具：
+
+ptz_move_and_capture
+ptz_zoom_and_capture
+ptz_move_zoom_and_capture
+ptz_find_target_zoom_and_capture
+这样对 LLM 来说：
+
+少一次多工具编排
+少一次顺序出错
+trace 更稳定
+推荐实施顺序
+先做方案 1
+这是最小闭环，能直接解决你现在所有测试项里的“几乎同时启动”。
+
+再做方案 2
+把串行/并行约束正式下沉到执行层。
+
+对高频场景做方案 3
+降低 LLM 自由编排带来的不确定性。
+
+方案 1 落地后的预期效果
+以下场景会恢复正确：
+
+“移动到 7 号预置位后截图”
+变成：move 完成后才 capture
+
+“放大 5 倍并截图”
+变成：zoom 完成后才 capture
+
+“移动到 5 号预置位放大 5 倍后截图”
+变成：move -> zoom -> capture
+
+“扫描预置位找到红墙，然后放大 5 倍后截图”
+变成：find_target -> zoom -> capture
+
+风险和注意点
+find_target_tool 内部本来就有自己的流程控制
+它本身不该再被拆成图级并发链路。
+
+串行化 PTZ 会增加总耗时
+但这是正确代价。PTZ 是物理设备，顺序正确优先于表面吞吐。
+
+不要只改 prompt
+prompt 已经证明不够，必须改执行图。
+
+我建议你直接做的版本
+只改一个文件为主：multi-agent-graph.ts
+
+改动包括：
+
+新增 ptzToolExecutor
+routeFromPtz() 固定路由到它
+ptzToolExecutor 内按 toolCalls 顺序执行
+结果回到 aggregateResults
+这是最干净的止血方案。
+
+
+
